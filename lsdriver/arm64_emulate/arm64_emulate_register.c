@@ -1,10748 +1,6003 @@
-#include "arm64_emulate_internal.h"
+/*
+ARM64 指令执行器：数据处理寄存器类。
 
-/* ======================== 数据处理寄存器类：专属硬件语义辅助 ======================== */
+emu_* 函数完成移位寄存器、扩展寄存器、加减与逻辑运算、ADC/SBC、条件选择与条件比较、除法和可变移位。
+同时覆盖 CRC、位计数与反转、最值、乘加、乘减、高位乘法及相关标志更新；w32/w64 函数区分操作数宽度。
+emu_build_register_executor() 负责按指令、宽度、条件码、移位类型和扩展类型选择具体执行函数。
+*/
+#include "emulate_inst.h"
 
-// clang-format off
-static inline bool emu_cond_select_hw(enum arm64_instruction instruction, uint64_t a, uint64_t b, uint64_t nzcv, uint32_t condition, bool sf, uint64_t *result)
+static inline void emu_and_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    uint32_t take = emu_cond_holds(nzcv, condition);
-
-    if (!result) return false;
-
-    switch (instruction)
-    {
-    case ARM64_INSN_CSEL:
-        *result = sf ? emu_template_csel_w64(a, b, take) : emu_template_csel_w32(a, b, take);
-        return true;
-    case ARM64_INSN_CSINC:
-        *result = sf ? emu_template_csinc_w64(a, b, take) : emu_template_csinc_w32(a, b, take);
-        return true;
-    case ARM64_INSN_CSINV:
-        *result = sf ? emu_template_csinv_w64(a, b, take) : emu_template_csinv_w32(a, b, take);
-        return true;
-    case ARM64_INSN_CSNEG:
-        *result = sf ? emu_template_csneg_w64(a, b, take) : emu_template_csneg_w32(a, b, take);
-        return true;
-    default:
-        return false;
-    }
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-/* ADD/SUB 扩展寄存器：option 000..111 对应 UXT 或 SXT 变体，结果再左移 shift 位。 */
-static inline uint64_t emu_extend_reg(uint64_t val, uint32_t option, uint32_t shift)
-{
-    switch (option)
-    {
-    case 0: return emu_template_uxtb_shift(val, shift);
-    case 1: return emu_template_uxth_shift(val, shift);
-    case 2: return emu_template_uxtw_shift(val, shift);
-    case 3: return emu_template_uxtx_shift(val, shift);
-    case 4: return emu_template_sxtb_shift(val, shift);
-    case 5: return emu_template_sxth_shift(val, shift);
-    case 6: return emu_template_sxtw_shift(val, shift);
-    case 7: return emu_template_sxtx_shift(val, shift);
-    default:
-        return val;
-    }
+static inline void emu_and_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline bool emu_addsub_carry_hw(enum arm64_instruction instruction, uint64_t a, uint64_t b, uint64_t input_nzcv, bool sf, uint64_t *result, uint64_t *nzcv, bool *setflags)
-{
-    if (!result || !nzcv || !setflags) return false;
-    *setflags = false;
-    switch (instruction)
-    {
-    case ARM64_INSN_ADC:
-        *result = sf ? emu_template_adc_w64(a, b, input_nzcv) : emu_template_adc_w32(a, b, input_nzcv);
-        return true;
-    case ARM64_INSN_ADCS:
-        *result = sf ? emu_template_adcs_w64(a, b, input_nzcv, nzcv) : emu_template_adcs_w32(a, b, input_nzcv, nzcv);
-        *setflags = true;
-        return true;
-    case ARM64_INSN_SBC:
-        *result = sf ? emu_template_sbc_w64(a, b, input_nzcv) : emu_template_sbc_w32(a, b, input_nzcv);
-        return true;
-    case ARM64_INSN_SBCS:
-        *result = sf ? emu_template_sbcs_w64(a, b, input_nzcv, nzcv) : emu_template_sbcs_w32(a, b, input_nzcv, nzcv);
-        *setflags = true;
-        return true;
-    default:
-        return false;
-    }
+static inline void emu_and_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline uint64_t emu_dp_shift_hw(uint64_t value, uint32_t type, uint32_t amount, bool sf)
+static inline void emu_and_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    switch (type)
-    {
-    case 0: return sf ? emu_template_lslv_w64(value, amount) : emu_template_lslv_w32(value, amount);
-    case 1: return sf ? emu_template_lsrv_w64(value, amount) : emu_template_lsrv_w32(value, amount);
-    case 2: return sf ? emu_template_asrv_w64(value, amount) : emu_template_asrv_w32(value, amount);
-    default: return sf ? emu_template_rorv_w64(value, amount) : emu_template_rorv_w32(value, amount);
-    }
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-// clang-format on
-
-static inline uint64_t emu_dp_rbit_hw(uint64_t value, bool sf)
+static inline void emu_and_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    return sf ? emu_template_rbit_w64(value) : emu_template_rbit_w32(value);
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline uint64_t emu_dp_rev16_hw(uint64_t value, bool sf)
+static inline void emu_and_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    return sf ? emu_template_rev16_w64(value) : emu_template_rev16_w32(value);
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline uint64_t emu_dp_rev32_hw(uint64_t value, bool sf)
+static inline void emu_and_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    return sf ? emu_template_rev32_w64(value) : emu_template_rev32_w32(value);
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline uint64_t emu_dp_rev64_hw(uint64_t value)
+static inline void emu_and_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    return emu_template_rev64_w64(value);
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    and_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline uint64_t emu_dp_clz_hw(uint64_t value, bool sf)
+static inline void emu_bic_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    return sf ? emu_template_clz_w64(value) : emu_template_clz_w32(value);
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline uint64_t emu_dp_cls_hw(uint64_t value, bool sf)
+static inline void emu_bic_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    return sf ? emu_template_cls_w64(value) : emu_template_cls_w32(value);
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static inline uint32_t emu_dp_count_bits_hw(uint64_t value, bool sf)
+static inline void emu_bic_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-    return sf ? emu_template_cnt_w64(value) : emu_template_cnt_w32(value);
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-/* ======================== 数据处理寄存器类：缓存条目执行模板 ======================== */
-
-/* 每个固定寄存器执行模板直接对应缓存条目中的 execute 函数地址。 */
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bic_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bic_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bic_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bic_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bic_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    bic_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_and_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_AND_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orr_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orr_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bic_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BIC_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_orn_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    orn_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orr_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eor_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eor_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_orn_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ORN_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_w(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_eon_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t shifted_output __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &shifted_output, 0, 0, 0, 0);
+    eon_x(read_gpr_or_zr(regs, entry->decoded.rn), shifted_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eor_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EOR_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_ands_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    ands_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_eon_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_EON_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_w_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_bics_shifted_register_x_ror(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    bics_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    add_shifted_w_lsl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    add_shifted_x_lsl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ands_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ANDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    add_shifted_w_lsr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    add_shifted_x_lsr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    add_shifted_w_asr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    add_shifted_x_asr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_bics_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_BICS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    result = emu_logic_hw(instruction, reg_read(regs, entry->reg0), b, sf, &nzcv, &setflags);
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sub_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sub_shifted_w_lsl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sub_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sub_shifted_x_lsl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sub_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sub_shifted_w_lsr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sub_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sub_shifted_x_lsr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sub_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sub_shifted_w_asr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sub_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sub_shifted_x_asr(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_subs_shifted_register_w_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_subs_shifted_register_x_lsl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_subs_shifted_register_w_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_subs_shifted_register_x_lsr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_subs_shifted_register_w_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_subs_shifted_register_x_asr(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_zr(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w32_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w64_shift0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 0, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w32_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w64_shift1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 1, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_w_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w32_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_add_extended_register_x_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    add_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w64_shift2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 2, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_extended_register_w_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w32_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_extended_register_x_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_shifted_register_w64_shift3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_SHIFTED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_dp_shift_hw(reg_read(regs, entry->reg1), 3, entry->option0, sf);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_adds_extended_register_w_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_x_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_w_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_x_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_w_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_x_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_w_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_x_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_w_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_x_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_w_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_x_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_w_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adds_extended_register_x_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    adds_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w32_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_add_extended_register_w64_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADD_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_w_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_w(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sub_extended_register_x_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t extended_output __attribute__((__uninitialized__));
+    uint64_t *output = gpr_output_or_sp(regs, entry->decoded.rd);
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &extended_output, 0, 0, 0, 0);
+    sub_x(read_gpr_or_sp(regs, entry->decoded.rn), extended_output, 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w32_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_uxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adds_extended_register_w64_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADDS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_uxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_uxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    uxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_uxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_uxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_sxtb(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtb_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_sxth(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxth_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_sxtw(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    sxtw_x_shift(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_w_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_w(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, false);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_subs_extended_register_x_sxtx(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t template_output0 __attribute__((__uninitialized__));
+    uint64_t template_output1 __attribute__((__uninitialized__));
+    lslv_x_sxtx(read_gpr_or_zr(regs, entry->decoded.rm), entry->decoded.shift_amount, 0, 0, 0, &template_output0, 0, 0, 0, 0);
+    subs_x(read_gpr_or_sp(regs, entry->decoded.rn), template_output0, 0, 0, 0, &template_output0, &template_output1, 0, 0, 0);
+    write_nzcv(regs, template_output1);
+    write_gpr_or_zr(regs, entry->decoded.rd, template_output0, true);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adc_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    adc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w32_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adc_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    adc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sub_extended_register_w64_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUB_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adcs_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    adcs_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, &flags, 0, 0, 0);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_adcs_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    adcs_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, &flags, 0, 0, 0);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 0, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sbc_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sbc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sbc_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sbc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 1, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sbcs_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sbcs_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, &flags, 0, 0, 0);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_sbcs_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags __attribute__((__uninitialized__));
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sbcs_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_nzcv(regs), 0, 0, output, &flags, 0, 0, 0);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 2, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 3, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 4, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 5, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 6, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w32_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = false;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_subs_extended_register_w64_opt7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SUBS_EXTENDED_REGISTER;
-    bool sf = true;
-    uint64_t b = emu_extend_reg(reg_read(regs, entry->reg1), 7, entry->option0);
-    uint64_t nzcv = 0;
-    bool setflags;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_addsub_hw(instruction, addr_reg_read(regs, entry->reg0), b, sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags)
-    {
-        emu_write_nzcv(regs, nzcv);
-        reg_write(regs, entry->reg2, result, sf);
-    }
-    else
-    {
-        addr_reg_write(regs, entry->reg2, result);
-    }
+static inline void emu_csel_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adc_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADC;
-    bool sf = false;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adc_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADC;
-    bool sf = true;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adcs_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADCS;
-    bool sf = false;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_adcs_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ADCS;
-    bool sf = true;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sbc_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SBC;
-    bool sf = false;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sbc_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SBC;
-    bool sf = true;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sbcs_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SBCS;
-    bool sf = false;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sbcs_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SBCS;
-    bool sf = true;
-    uint64_t result, nzcv;
-    bool setflags;
-
-    (void)fp_regs;
-    if (!emu_addsub_carry_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), sf, &result, &nzcv, &setflags)) return EMU_INSN_SKIP;
-    if (setflags) emu_write_nzcv(regs, nzcv);
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csel_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csel_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csel_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSEL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinc_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinc_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinc_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINC;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csinv_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csinv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csinv_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSINV;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 0), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 1), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 2), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 3), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 4), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 5), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 0, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 6), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 1, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 7), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 2, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 8), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 3, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 9), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 4, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 10), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 5, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 11), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 6, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 12), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 7, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 13), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 8, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 14), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 9, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_csneg_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    csneg_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), cond_holds(read_nzcv(regs), 15), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 10, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_udiv_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    udiv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 11, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_udiv_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    udiv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 12, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sdiv_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sdiv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 13, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_sdiv_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    sdiv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 14, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_lslv_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_csneg_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CSNEG;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_cond_select_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), emu_read_nzcv(regs), 15, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_lslv_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lslv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_udiv_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UDIV;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_lsrv_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_udiv_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UDIV;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_lsrv_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    lsrv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sdiv_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SDIV;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_asrv_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_sdiv_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SDIV;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_asrv_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    asrv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_lslv_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_LSLV;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_rorv_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_lslv_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_LSLV;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_rorv_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rorv_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_lsrv_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_LSRV;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32b_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32b(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_lsrv_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_LSRV;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32h_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32h(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_asrv_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ASRV;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32w_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_asrv_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ASRV;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32x_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rorv_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_RORV;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32cb_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32cb(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rorv_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_RORV;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32ch_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32ch(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32b_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32B;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32cw_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32cw(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32b_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32B;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_crc32cx_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    crc32cx(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32h_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32H;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_smax_register_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    smax_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32h_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32H;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_smax_register_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    smax_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32w_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32W;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_umax_register_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    umax_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32w_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32W;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_umax_register_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    umax_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32x_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32X;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_smin_register_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    smin_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32x_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32X;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_smin_register_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    smin_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32cb_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CB;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_umin_register_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    umin_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32cb_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CB;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_umin_register_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    umin_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32ch_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CH;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_madd_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    madd_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32ch_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CH;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_madd_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    madd_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32cw_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CW;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_msub_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    msub_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32cw_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CW;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_msub_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    msub_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32cx_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CX;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_smaddl_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    smaddl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_crc32cx_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CRC32CX;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_smsubl_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    smsubl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_smax_register_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMAX_REGISTER;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_smulh_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    smulh(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_smax_register_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMAX_REGISTER;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_umaddl_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    umaddl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_umax_register_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMAX_REGISTER;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
+static inline void emu_umsubl_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    umsubl(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), read_gpr_or_zr(regs, entry->decoded.ra), 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umax_register_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMAX_REGISTER;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static inline bool emu_multiply_hw(enum arm64_instruction instruction, uint64_t n, uint64_t m, uint64_t a, bool sf, uint64_t *result)
-{
-    if (!result) return false;
-    switch (instruction)
-    {
-    case ARM64_INSN_MADD: *result = sf ? emu_template_madd_w64(n, m, a) : emu_template_madd_w32(n, m, a); return true;
-    case ARM64_INSN_MSUB: *result = sf ? emu_template_msub_w64(n, m, a) : emu_template_msub_w32(n, m, a); return true;
-    case ARM64_INSN_SMADDL: *result = emu_template_smaddl(n, m, a); return true;
-    case ARM64_INSN_SMSUBL: *result = emu_template_smsubl(n, m, a); return true;
-    case ARM64_INSN_SMULH: *result = emu_template_smulh(n, m); return true;
-    case ARM64_INSN_UMADDL: *result = emu_template_umaddl(n, m, a); return true;
-    case ARM64_INSN_UMSUBL: *result = emu_template_umsubl(n, m, a); return true;
-    case ARM64_INSN_UMULH: *result = emu_template_umulh(n, m); return true;
-    default: return false;
-    }
-}
-
-static enum emu_insn_result emu_execute_register_smin_register_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMIN_REGISTER;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_smin_register_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMIN_REGISTER;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umin_register_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMIN_REGISTER;
-    bool sf = false;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umin_register_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMIN_REGISTER;
-    bool sf = true;
-    uint64_t a = reg_read(regs, entry->reg0) & emu_dp_mask(sf);
-    uint64_t b = reg_read(regs, entry->reg1) & emu_dp_mask(sf);
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_integer_binary_hw(instruction, a, b, b, sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg2, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_madd_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_MADD;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_madd_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_MADD;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_msub_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_MSUB;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_msub_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_MSUB;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_smaddl_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMADDL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_smaddl_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMADDL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_smsubl_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMSUBL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_smsubl_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMSUBL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_smulh_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMULH;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_smulh_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_SMULH;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umaddl_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMADDL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umaddl_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMADDL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umsubl_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMSUBL;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umsubl_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMSUBL;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umulh_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMULH;
-    bool sf = false;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_umulh_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_UMULH;
-    bool sf = true;
-    uint64_t result;
-
-    (void)fp_regs;
-    if (!emu_multiply_hw(instruction, reg_read(regs, entry->reg0), reg_read(regs, entry->reg1), reg_read(regs, entry->reg2), sf, &result)) return EMU_INSN_SKIP;
-    reg_write(regs, entry->reg3, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmn_register_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = false;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
-    {
-        flags = (uint64_t)entry->reg3 << 28;
-    }
-    emu_write_nzcv(regs, flags);
+    return;
+}
+static inline void emu_umulh_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    umulh(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, output, 0, 0, 0, 0);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_register_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_REGISTER;
-    bool sf = true;
-    uint64_t b = reg_read(regs, entry->reg1);
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
-    {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
-    }
-    else
+static inline void emu_ccmn_register_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
+static inline void emu_ccmn_register_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_register_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
+static inline void emu_ccmn_register_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_register_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
+static inline void emu_ccmn_register_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_register_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
+static inline void emu_ccmp_register_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
+static inline void emu_ccmp_register_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
+static inline void emu_ccmp_register_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
+static inline void emu_ccmp_register_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
+static inline void emu_ccmp_register_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
+static inline void emu_ccmp_register_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
+static inline void emu_ccmp_register_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
+static inline void emu_ccmp_register_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
+static inline void emu_ccmp_register_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
+static inline void emu_ccmp_register_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
+static inline void emu_ccmp_register_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
+static inline void emu_ccmp_register_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
+static inline void emu_ccmp_register_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
+static inline void emu_ccmp_register_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
+static inline void emu_ccmp_register_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmn_immediate_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMN_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
+static inline void emu_ccmp_register_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_register_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), read_gpr_or_zr(regs, entry->decoded.rm), 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
+static inline void emu_ccmn_immediate_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
+static inline void emu_ccmn_immediate_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
+static inline void emu_ccmn_immediate_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
+static inline void emu_ccmn_immediate_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
+static inline void emu_ccmn_immediate_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
+static inline void emu_ccmn_immediate_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
+static inline void emu_ccmn_immediate_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
+static inline void emu_ccmn_immediate_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
+static inline void emu_ccmn_immediate_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
+static inline void emu_ccmn_immediate_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
+static inline void emu_ccmn_immediate_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
+static inline void emu_ccmn_immediate_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
+static inline void emu_ccmn_immediate_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
+static inline void emu_ccmn_immediate_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
+static inline void emu_ccmn_immediate_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w32_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = false;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
+static inline void emu_ccmn_immediate_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmn_immediate_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmn_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond0(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 0))
+static inline void emu_ccmp_immediate_w_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond1(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 1))
+static inline void emu_ccmp_immediate_w_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond2(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 2))
+static inline void emu_ccmp_immediate_w_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond3(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 3))
+static inline void emu_ccmp_immediate_w_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond4(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 4))
+static inline void emu_ccmp_immediate_w_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond5(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 5))
+static inline void emu_ccmp_immediate_w_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond6(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 6))
+static inline void emu_ccmp_immediate_w_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond7(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 7))
+static inline void emu_ccmp_immediate_w_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_w_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_w(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond8(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 8))
+static inline void emu_ccmp_immediate_x_eq(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 0))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_ne(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 1))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond9(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 9))
+static inline void emu_ccmp_immediate_x_cs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 2))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_cc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 3))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond10(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 10))
+static inline void emu_ccmp_immediate_x_mi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 4))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_pl(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 5))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond11(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 11))
+static inline void emu_ccmp_immediate_x_vs(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 6))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_vc(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 7))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond12(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 12))
+static inline void emu_ccmp_immediate_x_hi(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 8))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_ls(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 9))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond13(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 13))
+static inline void emu_ccmp_immediate_x_ge(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 10))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_lt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 11))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond14(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 14))
+static inline void emu_ccmp_immediate_x_gt(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 12))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_le(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 13))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ccmp_immediate_w64_cond15(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CCMP_IMMEDIATE;
-    bool sf = true;
-    uint64_t b = entry->operand0;
-    uint64_t result, flags;
-    bool setflags;
-
-    (void)fp_regs;
-    if (emu_cond_holds(emu_read_nzcv(regs), 15))
+static inline void emu_ccmp_immediate_x_al(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 14))
     {
-        if (!emu_addsub_hw(instruction, reg_read(regs, entry->reg0), b, sf, &result, &flags, &setflags) || !setflags) return EMU_INSN_SKIP;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    else
+    write_nzcv(regs, flags);
+    regs->pc += 4;
+    return;
+}
+static inline void emu_ccmp_immediate_x_nv(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t flags = (uint64_t)entry->decoded.nzcv << 28;
+    if (cond_holds(read_nzcv(regs), 15))
     {
-        flags = (uint64_t)entry->reg3 << 28;
+        ccmp_al_x(read_gpr_or_zr(regs, entry->decoded.rn), entry->decoded.immediate, 0, 0, 0, &flags, 0, 0, 0, 0);
     }
-    emu_write_nzcv(regs, flags);
+    write_nzcv(regs, flags);
     regs->pc += 4;
-    return EMU_INSN_HANDLED;
-}
-
-static enum emu_insn_result emu_execute_register_rbit_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_RBIT;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rbit_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_RBIT;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_rbit_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rbit_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rev16_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_REV16;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_rbit_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rbit_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rev16_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_REV16;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_rev16_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rev16_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rev32_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_REV32;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_rev16_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rev16_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rev32_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_REV32;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_rev_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rev_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rev64_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_REV64;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_rev32_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rev32_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_rev64_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_REV64;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_rev_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    rev_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_clz_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CLZ;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_clz_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    clz_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_clz_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CLZ;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_clz_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    clz_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_cls_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CLS;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_cls_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    cls_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_cls_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CLS;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_cls_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    cls_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ctz_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CTZ;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_ctz_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    ctz_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_ctz_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CTZ;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_ctz_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    ctz_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_cnt_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CNT;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_cnt_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    cnt_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_cnt_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_CNT;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_cnt_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    cnt_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_abs_w32(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ABS;
-    bool sf = false;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_abs_w(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    abs_w(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-static enum emu_insn_result emu_execute_register_abs_w64(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-{
-    enum arm64_instruction instruction = (enum arm64_instruction)ARM64_INSN_ABS;
-    bool sf = true;
-    uint64_t src = reg_read(regs, entry->reg0);
-    uint64_t result;
-
-    (void)fp_regs;
-    switch (instruction)
-    {
-    case ARM64_INSN_RBIT:
-        result = emu_dp_rbit_hw(src, sf);
-        break;
-    case ARM64_INSN_REV16:
-        result = emu_dp_rev16_hw(src, sf);
-        break;
-    case ARM64_INSN_REV32:
-        result = emu_dp_rev32_hw(src, sf);
-        break;
-    case ARM64_INSN_REV64:
-        result = emu_dp_rev64_hw(src);
-        break;
-    case ARM64_INSN_CLZ:
-        result = emu_dp_clz_hw(src, sf);
-        break;
-    case ARM64_INSN_CLS:
-        result = emu_dp_cls_hw(src, sf);
-        break;
-    case ARM64_INSN_CTZ:
-        result = emu_dp_clz_hw(emu_dp_rbit_hw(src, sf), sf);
-        break;
-    case ARM64_INSN_CNT:
-        result = emu_dp_count_bits_hw(src, sf);
-        break;
-    case ARM64_INSN_ABS:
-        result = sf ? emu_template_abs_w64(src) : emu_template_abs_w32(src);
-        break;
-    default:
-        return EMU_INSN_SKIP;
-    }
-    reg_write(regs, entry->reg1, result, sf);
-    regs->pc += 4;
-    return EMU_INSN_HANDLED;
+static inline void emu_abs_x(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
+{
+    uint64_t discard;
+    uint64_t *output = gpr_output_or_discard(regs, entry->decoded.rd, &discard);
+    abs_x(read_gpr_or_zr(regs, entry->decoded.rn), 0, 0, 0, 0, output, 0, 0, 0, 0);
+    regs->pc += 4;
+    return;
 }
-
-
-
-static enum emu_insn_result (*emu_select_register_executor(const struct arm64_decoded_instruction *decoded))(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
-
+void (*emu_build_register_executor(const struct arm64_decoded_instruction *decoded))(struct pt_regs *regs, struct fp_regs *fp_regs, const struct arm64_executor_entry *entry)
 {
-
     switch (decoded->instruction)
-
     {
-
-    case ARM64_INSN_AND_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_and_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_and_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_and_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_and_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_and_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_and_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_and_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_and_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_BIC_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_bic_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_bic_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_bic_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_bic_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_bic_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_bic_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_bic_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_bic_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_ORR_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_orr_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_orr_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_orr_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_orr_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_orr_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_orr_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_orr_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_orr_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_ORN_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_orn_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_orn_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_orn_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_orn_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_orn_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_orn_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_orn_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_orn_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_EOR_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_eor_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_eor_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_eor_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_eor_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_eor_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_eor_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_eor_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_eor_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_EON_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_eon_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_eon_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_eon_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_eon_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_eon_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_eon_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_eon_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_eon_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_ANDS_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_ands_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_ands_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_ands_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_ands_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_ands_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_ands_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_ands_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_ands_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_BICS_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_bics_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_bics_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_bics_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_bics_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_bics_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_bics_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_bics_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_bics_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_ADD_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_add_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_add_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_add_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_add_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_add_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_add_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_add_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_add_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_ADDS_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_adds_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_adds_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_adds_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_adds_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_adds_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_adds_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_adds_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_adds_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_SUB_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_sub_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_sub_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_sub_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_sub_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_sub_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_sub_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_sub_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_sub_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_SUBS_SHIFTED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 0) return emu_execute_register_subs_shifted_register_w32_shift0;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 0) return emu_execute_register_subs_shifted_register_w64_shift0;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 1) return emu_execute_register_subs_shifted_register_w32_shift1;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 1) return emu_execute_register_subs_shifted_register_w64_shift1;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 2) return emu_execute_register_subs_shifted_register_w32_shift2;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 2) return emu_execute_register_subs_shifted_register_w64_shift2;
-
-        if (decoded->operand_width == 32 && decoded->shift_type == 3) return emu_execute_register_subs_shifted_register_w32_shift3;
-
-        if (decoded->operand_width == 64 && decoded->shift_type == 3) return emu_execute_register_subs_shifted_register_w64_shift3;
-
-        return NULL;
-
-    case ARM64_INSN_ADD_EXTENDED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->option == 0) return emu_execute_register_add_extended_register_w32_opt0;
-
-        if (decoded->operand_width == 64 && decoded->option == 0) return emu_execute_register_add_extended_register_w64_opt0;
-
-        if (decoded->operand_width == 32 && decoded->option == 1) return emu_execute_register_add_extended_register_w32_opt1;
-
-        if (decoded->operand_width == 64 && decoded->option == 1) return emu_execute_register_add_extended_register_w64_opt1;
-
-        if (decoded->operand_width == 32 && decoded->option == 2) return emu_execute_register_add_extended_register_w32_opt2;
-
-        if (decoded->operand_width == 64 && decoded->option == 2) return emu_execute_register_add_extended_register_w64_opt2;
-
-        if (decoded->operand_width == 32 && decoded->option == 3) return emu_execute_register_add_extended_register_w32_opt3;
-
-        if (decoded->operand_width == 64 && decoded->option == 3) return emu_execute_register_add_extended_register_w64_opt3;
-
-        if (decoded->operand_width == 32 && decoded->option == 4) return emu_execute_register_add_extended_register_w32_opt4;
-
-        if (decoded->operand_width == 64 && decoded->option == 4) return emu_execute_register_add_extended_register_w64_opt4;
-
-        if (decoded->operand_width == 32 && decoded->option == 5) return emu_execute_register_add_extended_register_w32_opt5;
-
-        if (decoded->operand_width == 64 && decoded->option == 5) return emu_execute_register_add_extended_register_w64_opt5;
-
-        if (decoded->operand_width == 32 && decoded->option == 6) return emu_execute_register_add_extended_register_w32_opt6;
-
-        if (decoded->operand_width == 64 && decoded->option == 6) return emu_execute_register_add_extended_register_w64_opt6;
-
-        if (decoded->operand_width == 32 && decoded->option == 7) return emu_execute_register_add_extended_register_w32_opt7;
-
-        if (decoded->operand_width == 64 && decoded->option == 7) return emu_execute_register_add_extended_register_w64_opt7;
-
-        return NULL;
-
-    case ARM64_INSN_ADDS_EXTENDED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->option == 0) return emu_execute_register_adds_extended_register_w32_opt0;
-
-        if (decoded->operand_width == 64 && decoded->option == 0) return emu_execute_register_adds_extended_register_w64_opt0;
-
-        if (decoded->operand_width == 32 && decoded->option == 1) return emu_execute_register_adds_extended_register_w32_opt1;
-
-        if (decoded->operand_width == 64 && decoded->option == 1) return emu_execute_register_adds_extended_register_w64_opt1;
-
-        if (decoded->operand_width == 32 && decoded->option == 2) return emu_execute_register_adds_extended_register_w32_opt2;
-
-        if (decoded->operand_width == 64 && decoded->option == 2) return emu_execute_register_adds_extended_register_w64_opt2;
-
-        if (decoded->operand_width == 32 && decoded->option == 3) return emu_execute_register_adds_extended_register_w32_opt3;
-
-        if (decoded->operand_width == 64 && decoded->option == 3) return emu_execute_register_adds_extended_register_w64_opt3;
-
-        if (decoded->operand_width == 32 && decoded->option == 4) return emu_execute_register_adds_extended_register_w32_opt4;
-
-        if (decoded->operand_width == 64 && decoded->option == 4) return emu_execute_register_adds_extended_register_w64_opt4;
-
-        if (decoded->operand_width == 32 && decoded->option == 5) return emu_execute_register_adds_extended_register_w32_opt5;
-
-        if (decoded->operand_width == 64 && decoded->option == 5) return emu_execute_register_adds_extended_register_w64_opt5;
-
-        if (decoded->operand_width == 32 && decoded->option == 6) return emu_execute_register_adds_extended_register_w32_opt6;
-
-        if (decoded->operand_width == 64 && decoded->option == 6) return emu_execute_register_adds_extended_register_w64_opt6;
-
-        if (decoded->operand_width == 32 && decoded->option == 7) return emu_execute_register_adds_extended_register_w32_opt7;
-
-        if (decoded->operand_width == 64 && decoded->option == 7) return emu_execute_register_adds_extended_register_w64_opt7;
-
-        return NULL;
-
-    case ARM64_INSN_SUB_EXTENDED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->option == 0) return emu_execute_register_sub_extended_register_w32_opt0;
-
-        if (decoded->operand_width == 64 && decoded->option == 0) return emu_execute_register_sub_extended_register_w64_opt0;
-
-        if (decoded->operand_width == 32 && decoded->option == 1) return emu_execute_register_sub_extended_register_w32_opt1;
-
-        if (decoded->operand_width == 64 && decoded->option == 1) return emu_execute_register_sub_extended_register_w64_opt1;
-
-        if (decoded->operand_width == 32 && decoded->option == 2) return emu_execute_register_sub_extended_register_w32_opt2;
-
-        if (decoded->operand_width == 64 && decoded->option == 2) return emu_execute_register_sub_extended_register_w64_opt2;
-
-        if (decoded->operand_width == 32 && decoded->option == 3) return emu_execute_register_sub_extended_register_w32_opt3;
-
-        if (decoded->operand_width == 64 && decoded->option == 3) return emu_execute_register_sub_extended_register_w64_opt3;
-
-        if (decoded->operand_width == 32 && decoded->option == 4) return emu_execute_register_sub_extended_register_w32_opt4;
-
-        if (decoded->operand_width == 64 && decoded->option == 4) return emu_execute_register_sub_extended_register_w64_opt4;
-
-        if (decoded->operand_width == 32 && decoded->option == 5) return emu_execute_register_sub_extended_register_w32_opt5;
-
-        if (decoded->operand_width == 64 && decoded->option == 5) return emu_execute_register_sub_extended_register_w64_opt5;
-
-        if (decoded->operand_width == 32 && decoded->option == 6) return emu_execute_register_sub_extended_register_w32_opt6;
-
-        if (decoded->operand_width == 64 && decoded->option == 6) return emu_execute_register_sub_extended_register_w64_opt6;
-
-        if (decoded->operand_width == 32 && decoded->option == 7) return emu_execute_register_sub_extended_register_w32_opt7;
-
-        if (decoded->operand_width == 64 && decoded->option == 7) return emu_execute_register_sub_extended_register_w64_opt7;
-
-        return NULL;
-
-    case ARM64_INSN_SUBS_EXTENDED_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->option == 0) return emu_execute_register_subs_extended_register_w32_opt0;
-
-        if (decoded->operand_width == 64 && decoded->option == 0) return emu_execute_register_subs_extended_register_w64_opt0;
-
-        if (decoded->operand_width == 32 && decoded->option == 1) return emu_execute_register_subs_extended_register_w32_opt1;
-
-        if (decoded->operand_width == 64 && decoded->option == 1) return emu_execute_register_subs_extended_register_w64_opt1;
-
-        if (decoded->operand_width == 32 && decoded->option == 2) return emu_execute_register_subs_extended_register_w32_opt2;
-
-        if (decoded->operand_width == 64 && decoded->option == 2) return emu_execute_register_subs_extended_register_w64_opt2;
-
-        if (decoded->operand_width == 32 && decoded->option == 3) return emu_execute_register_subs_extended_register_w32_opt3;
-
-        if (decoded->operand_width == 64 && decoded->option == 3) return emu_execute_register_subs_extended_register_w64_opt3;
-
-        if (decoded->operand_width == 32 && decoded->option == 4) return emu_execute_register_subs_extended_register_w32_opt4;
-
-        if (decoded->operand_width == 64 && decoded->option == 4) return emu_execute_register_subs_extended_register_w64_opt4;
-
-        if (decoded->operand_width == 32 && decoded->option == 5) return emu_execute_register_subs_extended_register_w32_opt5;
-
-        if (decoded->operand_width == 64 && decoded->option == 5) return emu_execute_register_subs_extended_register_w64_opt5;
-
-        if (decoded->operand_width == 32 && decoded->option == 6) return emu_execute_register_subs_extended_register_w32_opt6;
-
-        if (decoded->operand_width == 64 && decoded->option == 6) return emu_execute_register_subs_extended_register_w64_opt6;
-
-        if (decoded->operand_width == 32 && decoded->option == 7) return emu_execute_register_subs_extended_register_w32_opt7;
-
-        if (decoded->operand_width == 64 && decoded->option == 7) return emu_execute_register_subs_extended_register_w64_opt7;
-
-        return NULL;
-
-    case ARM64_INSN_ADC:
-
-        if (decoded->operand_width == 32) return emu_execute_register_adc_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_adc_w64;
-
-        return NULL;
-
-    case ARM64_INSN_ADCS:
-
-        if (decoded->operand_width == 32) return emu_execute_register_adcs_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_adcs_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SBC:
-
-        if (decoded->operand_width == 32) return emu_execute_register_sbc_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_sbc_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SBCS:
-
-        if (decoded->operand_width == 32) return emu_execute_register_sbcs_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_sbcs_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CSEL:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_csel_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_csel_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_csel_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_csel_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_csel_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_csel_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_csel_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_csel_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_csel_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_csel_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_csel_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_csel_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_csel_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_csel_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_csel_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_csel_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_csel_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_csel_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_csel_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_csel_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_csel_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_csel_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_csel_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_csel_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_csel_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_csel_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_csel_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_csel_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_csel_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_csel_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_csel_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_csel_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_CSINC:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_csinc_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_csinc_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_csinc_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_csinc_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_csinc_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_csinc_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_csinc_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_csinc_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_csinc_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_csinc_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_csinc_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_csinc_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_csinc_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_csinc_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_csinc_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_csinc_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_csinc_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_csinc_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_csinc_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_csinc_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_csinc_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_csinc_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_csinc_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_csinc_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_csinc_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_csinc_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_csinc_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_csinc_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_csinc_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_csinc_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_csinc_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_csinc_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_CSINV:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_csinv_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_csinv_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_csinv_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_csinv_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_csinv_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_csinv_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_csinv_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_csinv_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_csinv_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_csinv_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_csinv_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_csinv_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_csinv_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_csinv_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_csinv_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_csinv_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_csinv_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_csinv_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_csinv_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_csinv_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_csinv_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_csinv_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_csinv_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_csinv_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_csinv_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_csinv_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_csinv_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_csinv_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_csinv_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_csinv_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_csinv_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_csinv_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_CSNEG:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_csneg_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_csneg_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_csneg_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_csneg_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_csneg_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_csneg_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_csneg_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_csneg_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_csneg_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_csneg_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_csneg_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_csneg_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_csneg_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_csneg_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_csneg_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_csneg_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_csneg_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_csneg_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_csneg_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_csneg_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_csneg_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_csneg_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_csneg_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_csneg_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_csneg_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_csneg_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_csneg_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_csneg_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_csneg_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_csneg_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_csneg_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_csneg_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_UDIV:
-
-        if (decoded->operand_width == 32) return emu_execute_register_udiv_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_udiv_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SDIV:
-
-        if (decoded->operand_width == 32) return emu_execute_register_sdiv_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_sdiv_w64;
-
-        return NULL;
-
-    case ARM64_INSN_LSLV:
-
-        if (decoded->operand_width == 32) return emu_execute_register_lslv_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_lslv_w64;
-
-        return NULL;
-
-    case ARM64_INSN_LSRV:
-
-        if (decoded->operand_width == 32) return emu_execute_register_lsrv_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_lsrv_w64;
-
-        return NULL;
-
-    case ARM64_INSN_ASRV:
-
-        if (decoded->operand_width == 32) return emu_execute_register_asrv_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_asrv_w64;
-
-        return NULL;
-
-    case ARM64_INSN_RORV:
-
-        if (decoded->operand_width == 32) return emu_execute_register_rorv_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_rorv_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32B:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32b_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32b_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32H:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32h_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32h_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32W:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32w_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32w_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32X:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32x_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32x_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32CB:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32cb_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32cb_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32CH:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32ch_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32ch_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32CW:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32cw_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32cw_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CRC32CX:
-
-        if (decoded->operand_width == 32) return emu_execute_register_crc32cx_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_crc32cx_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SMAX_REGISTER:
-
-        if (decoded->operand_width == 32) return emu_execute_register_smax_register_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_smax_register_w64;
-
-        return NULL;
-
-    case ARM64_INSN_UMAX_REGISTER:
-
-        if (decoded->operand_width == 32) return emu_execute_register_umax_register_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_umax_register_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SMIN_REGISTER:
-
-        if (decoded->operand_width == 32) return emu_execute_register_smin_register_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_smin_register_w64;
-
-        return NULL;
-
-    case ARM64_INSN_UMIN_REGISTER:
-
-        if (decoded->operand_width == 32) return emu_execute_register_umin_register_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_umin_register_w64;
-
-        return NULL;
-
-    case ARM64_INSN_MADD:
-
-        if (decoded->operand_width == 32) return emu_execute_register_madd_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_madd_w64;
-
-        return NULL;
-
-    case ARM64_INSN_MSUB:
-
-        if (decoded->operand_width == 32) return emu_execute_register_msub_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_msub_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SMADDL:
-
-        if (decoded->operand_width == 32) return emu_execute_register_smaddl_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_smaddl_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SMSUBL:
-
-        if (decoded->operand_width == 32) return emu_execute_register_smsubl_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_smsubl_w64;
-
-        return NULL;
-
-    case ARM64_INSN_SMULH:
-
-        if (decoded->operand_width == 32) return emu_execute_register_smulh_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_smulh_w64;
-
-        return NULL;
-
-    case ARM64_INSN_UMADDL:
-
-        if (decoded->operand_width == 32) return emu_execute_register_umaddl_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_umaddl_w64;
-
-        return NULL;
-
-    case ARM64_INSN_UMSUBL:
-
-        if (decoded->operand_width == 32) return emu_execute_register_umsubl_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_umsubl_w64;
-
-        return NULL;
-
-    case ARM64_INSN_UMULH:
-
-        if (decoded->operand_width == 32) return emu_execute_register_umulh_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_umulh_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CCMN_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_ccmn_register_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_ccmn_register_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_ccmn_register_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_ccmn_register_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_ccmn_register_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_ccmn_register_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_ccmn_register_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_ccmn_register_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_ccmn_register_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_ccmn_register_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_ccmn_register_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_ccmn_register_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_ccmn_register_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_ccmn_register_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_ccmn_register_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_ccmn_register_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_ccmn_register_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_ccmn_register_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_ccmn_register_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_ccmn_register_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_ccmn_register_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_ccmn_register_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_ccmn_register_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_ccmn_register_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_ccmn_register_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_ccmn_register_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_ccmn_register_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_ccmn_register_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_ccmn_register_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_ccmn_register_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_ccmn_register_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_ccmn_register_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_CCMP_REGISTER:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_ccmp_register_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_ccmp_register_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_ccmp_register_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_ccmp_register_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_ccmp_register_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_ccmp_register_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_ccmp_register_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_ccmp_register_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_ccmp_register_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_ccmp_register_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_ccmp_register_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_ccmp_register_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_ccmp_register_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_ccmp_register_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_ccmp_register_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_ccmp_register_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_ccmp_register_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_ccmp_register_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_ccmp_register_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_ccmp_register_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_ccmp_register_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_ccmp_register_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_ccmp_register_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_ccmp_register_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_ccmp_register_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_ccmp_register_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_ccmp_register_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_ccmp_register_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_ccmp_register_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_ccmp_register_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_ccmp_register_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_ccmp_register_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_CCMN_IMMEDIATE:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_ccmn_immediate_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_ccmn_immediate_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_ccmn_immediate_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_ccmn_immediate_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_ccmn_immediate_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_ccmn_immediate_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_ccmn_immediate_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_ccmn_immediate_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_ccmn_immediate_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_ccmn_immediate_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_ccmn_immediate_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_ccmn_immediate_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_ccmn_immediate_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_ccmn_immediate_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_ccmn_immediate_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_ccmn_immediate_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_ccmn_immediate_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_ccmn_immediate_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_ccmn_immediate_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_ccmn_immediate_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_ccmn_immediate_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_ccmn_immediate_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_ccmn_immediate_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_ccmn_immediate_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_ccmn_immediate_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_ccmn_immediate_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_ccmn_immediate_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_ccmn_immediate_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_ccmn_immediate_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_ccmn_immediate_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_ccmn_immediate_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_ccmn_immediate_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_CCMP_IMMEDIATE:
-
-        if (decoded->operand_width == 32 && decoded->condition == 0) return emu_execute_register_ccmp_immediate_w32_cond0;
-
-        if (decoded->operand_width == 32 && decoded->condition == 1) return emu_execute_register_ccmp_immediate_w32_cond1;
-
-        if (decoded->operand_width == 32 && decoded->condition == 2) return emu_execute_register_ccmp_immediate_w32_cond2;
-
-        if (decoded->operand_width == 32 && decoded->condition == 3) return emu_execute_register_ccmp_immediate_w32_cond3;
-
-        if (decoded->operand_width == 32 && decoded->condition == 4) return emu_execute_register_ccmp_immediate_w32_cond4;
-
-        if (decoded->operand_width == 32 && decoded->condition == 5) return emu_execute_register_ccmp_immediate_w32_cond5;
-
-        if (decoded->operand_width == 32 && decoded->condition == 6) return emu_execute_register_ccmp_immediate_w32_cond6;
-
-        if (decoded->operand_width == 32 && decoded->condition == 7) return emu_execute_register_ccmp_immediate_w32_cond7;
-
-        if (decoded->operand_width == 32 && decoded->condition == 8) return emu_execute_register_ccmp_immediate_w32_cond8;
-
-        if (decoded->operand_width == 32 && decoded->condition == 9) return emu_execute_register_ccmp_immediate_w32_cond9;
-
-        if (decoded->operand_width == 32 && decoded->condition == 10) return emu_execute_register_ccmp_immediate_w32_cond10;
-
-        if (decoded->operand_width == 32 && decoded->condition == 11) return emu_execute_register_ccmp_immediate_w32_cond11;
-
-        if (decoded->operand_width == 32 && decoded->condition == 12) return emu_execute_register_ccmp_immediate_w32_cond12;
-
-        if (decoded->operand_width == 32 && decoded->condition == 13) return emu_execute_register_ccmp_immediate_w32_cond13;
-
-        if (decoded->operand_width == 32 && decoded->condition == 14) return emu_execute_register_ccmp_immediate_w32_cond14;
-
-        if (decoded->operand_width == 32 && decoded->condition == 15) return emu_execute_register_ccmp_immediate_w32_cond15;
-
-        if (decoded->operand_width == 64 && decoded->condition == 0) return emu_execute_register_ccmp_immediate_w64_cond0;
-
-        if (decoded->operand_width == 64 && decoded->condition == 1) return emu_execute_register_ccmp_immediate_w64_cond1;
-
-        if (decoded->operand_width == 64 && decoded->condition == 2) return emu_execute_register_ccmp_immediate_w64_cond2;
-
-        if (decoded->operand_width == 64 && decoded->condition == 3) return emu_execute_register_ccmp_immediate_w64_cond3;
-
-        if (decoded->operand_width == 64 && decoded->condition == 4) return emu_execute_register_ccmp_immediate_w64_cond4;
-
-        if (decoded->operand_width == 64 && decoded->condition == 5) return emu_execute_register_ccmp_immediate_w64_cond5;
-
-        if (decoded->operand_width == 64 && decoded->condition == 6) return emu_execute_register_ccmp_immediate_w64_cond6;
-
-        if (decoded->operand_width == 64 && decoded->condition == 7) return emu_execute_register_ccmp_immediate_w64_cond7;
-
-        if (decoded->operand_width == 64 && decoded->condition == 8) return emu_execute_register_ccmp_immediate_w64_cond8;
-
-        if (decoded->operand_width == 64 && decoded->condition == 9) return emu_execute_register_ccmp_immediate_w64_cond9;
-
-        if (decoded->operand_width == 64 && decoded->condition == 10) return emu_execute_register_ccmp_immediate_w64_cond10;
-
-        if (decoded->operand_width == 64 && decoded->condition == 11) return emu_execute_register_ccmp_immediate_w64_cond11;
-
-        if (decoded->operand_width == 64 && decoded->condition == 12) return emu_execute_register_ccmp_immediate_w64_cond12;
-
-        if (decoded->operand_width == 64 && decoded->condition == 13) return emu_execute_register_ccmp_immediate_w64_cond13;
-
-        if (decoded->operand_width == 64 && decoded->condition == 14) return emu_execute_register_ccmp_immediate_w64_cond14;
-
-        if (decoded->operand_width == 64 && decoded->condition == 15) return emu_execute_register_ccmp_immediate_w64_cond15;
-
-        return NULL;
-
-    case ARM64_INSN_RBIT:
-
-        if (decoded->operand_width == 32) return emu_execute_register_rbit_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_rbit_w64;
-
-        return NULL;
-
-    case ARM64_INSN_REV16:
-
-        if (decoded->operand_width == 32) return emu_execute_register_rev16_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_rev16_w64;
-
-        return NULL;
-
-    case ARM64_INSN_REV32:
-
-        if (decoded->operand_width == 32) return emu_execute_register_rev32_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_rev32_w64;
-
-        return NULL;
-
-    case ARM64_INSN_REV64:
-
-        if (decoded->operand_width == 32) return emu_execute_register_rev64_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_rev64_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CLZ:
-
-        if (decoded->operand_width == 32) return emu_execute_register_clz_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_clz_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CLS:
-
-        if (decoded->operand_width == 32) return emu_execute_register_cls_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_cls_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CTZ:
-
-        if (decoded->operand_width == 32) return emu_execute_register_ctz_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_ctz_w64;
-
-        return NULL;
-
-    case ARM64_INSN_CNT:
-
-        if (decoded->operand_width == 32) return emu_execute_register_cnt_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_cnt_w64;
-
-        return NULL;
-
-    case ARM64_INSN_ABS:
-
-        if (decoded->operand_width == 32) return emu_execute_register_abs_w32;
-
-        if (decoded->operand_width == 64) return emu_execute_register_abs_w64;
-
-        return NULL;
-
+    case ARM64_INST_AND_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_and_shifted_register_w_lsl;
+            case 1:
+                return emu_and_shifted_register_w_lsr;
+            case 2:
+                return emu_and_shifted_register_w_asr;
+            case 3:
+                return emu_and_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_and_shifted_register_x_lsl;
+            case 1:
+                return emu_and_shifted_register_x_lsr;
+            case 2:
+                return emu_and_shifted_register_x_asr;
+            case 3:
+                return emu_and_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_BIC_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_bic_shifted_register_w_lsl;
+            case 1:
+                return emu_bic_shifted_register_w_lsr;
+            case 2:
+                return emu_bic_shifted_register_w_asr;
+            case 3:
+                return emu_bic_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_bic_shifted_register_x_lsl;
+            case 1:
+                return emu_bic_shifted_register_x_lsr;
+            case 2:
+                return emu_bic_shifted_register_x_asr;
+            case 3:
+                return emu_bic_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ORR_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_orr_shifted_register_w_lsl;
+            case 1:
+                return emu_orr_shifted_register_w_lsr;
+            case 2:
+                return emu_orr_shifted_register_w_asr;
+            case 3:
+                return emu_orr_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_orr_shifted_register_x_lsl;
+            case 1:
+                return emu_orr_shifted_register_x_lsr;
+            case 2:
+                return emu_orr_shifted_register_x_asr;
+            case 3:
+                return emu_orr_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ORN_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_orn_shifted_register_w_lsl;
+            case 1:
+                return emu_orn_shifted_register_w_lsr;
+            case 2:
+                return emu_orn_shifted_register_w_asr;
+            case 3:
+                return emu_orn_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_orn_shifted_register_x_lsl;
+            case 1:
+                return emu_orn_shifted_register_x_lsr;
+            case 2:
+                return emu_orn_shifted_register_x_asr;
+            case 3:
+                return emu_orn_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_EOR_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_eor_shifted_register_w_lsl;
+            case 1:
+                return emu_eor_shifted_register_w_lsr;
+            case 2:
+                return emu_eor_shifted_register_w_asr;
+            case 3:
+                return emu_eor_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_eor_shifted_register_x_lsl;
+            case 1:
+                return emu_eor_shifted_register_x_lsr;
+            case 2:
+                return emu_eor_shifted_register_x_asr;
+            case 3:
+                return emu_eor_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_EON_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_eon_shifted_register_w_lsl;
+            case 1:
+                return emu_eon_shifted_register_w_lsr;
+            case 2:
+                return emu_eon_shifted_register_w_asr;
+            case 3:
+                return emu_eon_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_eon_shifted_register_x_lsl;
+            case 1:
+                return emu_eon_shifted_register_x_lsr;
+            case 2:
+                return emu_eon_shifted_register_x_asr;
+            case 3:
+                return emu_eon_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ANDS_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_ands_shifted_register_w_lsl;
+            case 1:
+                return emu_ands_shifted_register_w_lsr;
+            case 2:
+                return emu_ands_shifted_register_w_asr;
+            case 3:
+                return emu_ands_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_ands_shifted_register_x_lsl;
+            case 1:
+                return emu_ands_shifted_register_x_lsr;
+            case 2:
+                return emu_ands_shifted_register_x_asr;
+            case 3:
+                return emu_ands_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_BICS_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_bics_shifted_register_w_lsl;
+            case 1:
+                return emu_bics_shifted_register_w_lsr;
+            case 2:
+                return emu_bics_shifted_register_w_asr;
+            case 3:
+                return emu_bics_shifted_register_w_ror;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_bics_shifted_register_x_lsl;
+            case 1:
+                return emu_bics_shifted_register_x_lsr;
+            case 2:
+                return emu_bics_shifted_register_x_asr;
+            case 3:
+                return emu_bics_shifted_register_x_ror;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ADD_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_add_shifted_register_w_lsl;
+            case 1:
+                return emu_add_shifted_register_w_lsr;
+            case 2:
+                return emu_add_shifted_register_w_asr;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_add_shifted_register_x_lsl;
+            case 1:
+                return emu_add_shifted_register_x_lsr;
+            case 2:
+                return emu_add_shifted_register_x_asr;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ADDS_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_adds_shifted_register_w_lsl;
+            case 1:
+                return emu_adds_shifted_register_w_lsr;
+            case 2:
+                return emu_adds_shifted_register_w_asr;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_adds_shifted_register_x_lsl;
+            case 1:
+                return emu_adds_shifted_register_x_lsr;
+            case 2:
+                return emu_adds_shifted_register_x_asr;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SUB_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_sub_shifted_register_w_lsl;
+            case 1:
+                return emu_sub_shifted_register_w_lsr;
+            case 2:
+                return emu_sub_shifted_register_w_asr;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_sub_shifted_register_x_lsl;
+            case 1:
+                return emu_sub_shifted_register_x_lsr;
+            case 2:
+                return emu_sub_shifted_register_x_asr;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SUBS_SHIFTED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_subs_shifted_register_w_lsl;
+            case 1:
+                return emu_subs_shifted_register_w_lsr;
+            case 2:
+                return emu_subs_shifted_register_w_asr;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->shift_type)
+            {
+            case 0:
+                return emu_subs_shifted_register_x_lsl;
+            case 1:
+                return emu_subs_shifted_register_x_lsr;
+            case 2:
+                return emu_subs_shifted_register_x_asr;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ADD_EXTENDED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_add_extended_register_w_uxtb;
+            case 1:
+                return emu_add_extended_register_w_uxth;
+            case 2:
+                return emu_add_extended_register_w_uxtw;
+            case 3:
+                return emu_add_extended_register_w_uxtx;
+            case 4:
+                return emu_add_extended_register_w_sxtb;
+            case 5:
+                return emu_add_extended_register_w_sxth;
+            case 6:
+                return emu_add_extended_register_w_sxtw;
+            case 7:
+                return emu_add_extended_register_w_sxtx;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_add_extended_register_x_uxtb;
+            case 1:
+                return emu_add_extended_register_x_uxth;
+            case 2:
+                return emu_add_extended_register_x_uxtw;
+            case 3:
+                return emu_add_extended_register_x_uxtx;
+            case 4:
+                return emu_add_extended_register_x_sxtb;
+            case 5:
+                return emu_add_extended_register_x_sxth;
+            case 6:
+                return emu_add_extended_register_x_sxtw;
+            case 7:
+                return emu_add_extended_register_x_sxtx;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ADDS_EXTENDED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_adds_extended_register_w_uxtb;
+            case 1:
+                return emu_adds_extended_register_w_uxth;
+            case 2:
+                return emu_adds_extended_register_w_uxtw;
+            case 3:
+                return emu_adds_extended_register_w_uxtx;
+            case 4:
+                return emu_adds_extended_register_w_sxtb;
+            case 5:
+                return emu_adds_extended_register_w_sxth;
+            case 6:
+                return emu_adds_extended_register_w_sxtw;
+            case 7:
+                return emu_adds_extended_register_w_sxtx;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_adds_extended_register_x_uxtb;
+            case 1:
+                return emu_adds_extended_register_x_uxth;
+            case 2:
+                return emu_adds_extended_register_x_uxtw;
+            case 3:
+                return emu_adds_extended_register_x_uxtx;
+            case 4:
+                return emu_adds_extended_register_x_sxtb;
+            case 5:
+                return emu_adds_extended_register_x_sxth;
+            case 6:
+                return emu_adds_extended_register_x_sxtw;
+            case 7:
+                return emu_adds_extended_register_x_sxtx;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SUB_EXTENDED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_sub_extended_register_w_uxtb;
+            case 1:
+                return emu_sub_extended_register_w_uxth;
+            case 2:
+                return emu_sub_extended_register_w_uxtw;
+            case 3:
+                return emu_sub_extended_register_w_uxtx;
+            case 4:
+                return emu_sub_extended_register_w_sxtb;
+            case 5:
+                return emu_sub_extended_register_w_sxth;
+            case 6:
+                return emu_sub_extended_register_w_sxtw;
+            case 7:
+                return emu_sub_extended_register_w_sxtx;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_sub_extended_register_x_uxtb;
+            case 1:
+                return emu_sub_extended_register_x_uxth;
+            case 2:
+                return emu_sub_extended_register_x_uxtw;
+            case 3:
+                return emu_sub_extended_register_x_uxtx;
+            case 4:
+                return emu_sub_extended_register_x_sxtb;
+            case 5:
+                return emu_sub_extended_register_x_sxth;
+            case 6:
+                return emu_sub_extended_register_x_sxtw;
+            case 7:
+                return emu_sub_extended_register_x_sxtx;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SUBS_EXTENDED_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_subs_extended_register_w_uxtb;
+            case 1:
+                return emu_subs_extended_register_w_uxth;
+            case 2:
+                return emu_subs_extended_register_w_uxtw;
+            case 3:
+                return emu_subs_extended_register_w_uxtx;
+            case 4:
+                return emu_subs_extended_register_w_sxtb;
+            case 5:
+                return emu_subs_extended_register_w_sxth;
+            case 6:
+                return emu_subs_extended_register_w_sxtw;
+            case 7:
+                return emu_subs_extended_register_w_sxtx;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->extend_type)
+            {
+            case 0:
+                return emu_subs_extended_register_x_uxtb;
+            case 1:
+                return emu_subs_extended_register_x_uxth;
+            case 2:
+                return emu_subs_extended_register_x_uxtw;
+            case 3:
+                return emu_subs_extended_register_x_uxtx;
+            case 4:
+                return emu_subs_extended_register_x_sxtb;
+            case 5:
+                return emu_subs_extended_register_x_sxth;
+            case 6:
+                return emu_subs_extended_register_x_sxtw;
+            case 7:
+                return emu_subs_extended_register_x_sxtx;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ADC:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_adc_w;
+        case 64:
+            return emu_adc_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ADCS:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_adcs_w;
+        case 64:
+            return emu_adcs_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SBC:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_sbc_w;
+        case 64:
+            return emu_sbc_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SBCS:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_sbcs_w;
+        case 64:
+            return emu_sbcs_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CSEL:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csel_w_eq;
+            case 1:
+                return emu_csel_w_ne;
+            case 2:
+                return emu_csel_w_cs;
+            case 3:
+                return emu_csel_w_cc;
+            case 4:
+                return emu_csel_w_mi;
+            case 5:
+                return emu_csel_w_pl;
+            case 6:
+                return emu_csel_w_vs;
+            case 7:
+                return emu_csel_w_vc;
+            case 8:
+                return emu_csel_w_hi;
+            case 9:
+                return emu_csel_w_ls;
+            case 10:
+                return emu_csel_w_ge;
+            case 11:
+                return emu_csel_w_lt;
+            case 12:
+                return emu_csel_w_gt;
+            case 13:
+                return emu_csel_w_le;
+            case 14:
+                return emu_csel_w_al;
+            case 15:
+                return emu_csel_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csel_x_eq;
+            case 1:
+                return emu_csel_x_ne;
+            case 2:
+                return emu_csel_x_cs;
+            case 3:
+                return emu_csel_x_cc;
+            case 4:
+                return emu_csel_x_mi;
+            case 5:
+                return emu_csel_x_pl;
+            case 6:
+                return emu_csel_x_vs;
+            case 7:
+                return emu_csel_x_vc;
+            case 8:
+                return emu_csel_x_hi;
+            case 9:
+                return emu_csel_x_ls;
+            case 10:
+                return emu_csel_x_ge;
+            case 11:
+                return emu_csel_x_lt;
+            case 12:
+                return emu_csel_x_gt;
+            case 13:
+                return emu_csel_x_le;
+            case 14:
+                return emu_csel_x_al;
+            case 15:
+                return emu_csel_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CSINC:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csinc_w_eq;
+            case 1:
+                return emu_csinc_w_ne;
+            case 2:
+                return emu_csinc_w_cs;
+            case 3:
+                return emu_csinc_w_cc;
+            case 4:
+                return emu_csinc_w_mi;
+            case 5:
+                return emu_csinc_w_pl;
+            case 6:
+                return emu_csinc_w_vs;
+            case 7:
+                return emu_csinc_w_vc;
+            case 8:
+                return emu_csinc_w_hi;
+            case 9:
+                return emu_csinc_w_ls;
+            case 10:
+                return emu_csinc_w_ge;
+            case 11:
+                return emu_csinc_w_lt;
+            case 12:
+                return emu_csinc_w_gt;
+            case 13:
+                return emu_csinc_w_le;
+            case 14:
+                return emu_csinc_w_al;
+            case 15:
+                return emu_csinc_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csinc_x_eq;
+            case 1:
+                return emu_csinc_x_ne;
+            case 2:
+                return emu_csinc_x_cs;
+            case 3:
+                return emu_csinc_x_cc;
+            case 4:
+                return emu_csinc_x_mi;
+            case 5:
+                return emu_csinc_x_pl;
+            case 6:
+                return emu_csinc_x_vs;
+            case 7:
+                return emu_csinc_x_vc;
+            case 8:
+                return emu_csinc_x_hi;
+            case 9:
+                return emu_csinc_x_ls;
+            case 10:
+                return emu_csinc_x_ge;
+            case 11:
+                return emu_csinc_x_lt;
+            case 12:
+                return emu_csinc_x_gt;
+            case 13:
+                return emu_csinc_x_le;
+            case 14:
+                return emu_csinc_x_al;
+            case 15:
+                return emu_csinc_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CSINV:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csinv_w_eq;
+            case 1:
+                return emu_csinv_w_ne;
+            case 2:
+                return emu_csinv_w_cs;
+            case 3:
+                return emu_csinv_w_cc;
+            case 4:
+                return emu_csinv_w_mi;
+            case 5:
+                return emu_csinv_w_pl;
+            case 6:
+                return emu_csinv_w_vs;
+            case 7:
+                return emu_csinv_w_vc;
+            case 8:
+                return emu_csinv_w_hi;
+            case 9:
+                return emu_csinv_w_ls;
+            case 10:
+                return emu_csinv_w_ge;
+            case 11:
+                return emu_csinv_w_lt;
+            case 12:
+                return emu_csinv_w_gt;
+            case 13:
+                return emu_csinv_w_le;
+            case 14:
+                return emu_csinv_w_al;
+            case 15:
+                return emu_csinv_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csinv_x_eq;
+            case 1:
+                return emu_csinv_x_ne;
+            case 2:
+                return emu_csinv_x_cs;
+            case 3:
+                return emu_csinv_x_cc;
+            case 4:
+                return emu_csinv_x_mi;
+            case 5:
+                return emu_csinv_x_pl;
+            case 6:
+                return emu_csinv_x_vs;
+            case 7:
+                return emu_csinv_x_vc;
+            case 8:
+                return emu_csinv_x_hi;
+            case 9:
+                return emu_csinv_x_ls;
+            case 10:
+                return emu_csinv_x_ge;
+            case 11:
+                return emu_csinv_x_lt;
+            case 12:
+                return emu_csinv_x_gt;
+            case 13:
+                return emu_csinv_x_le;
+            case 14:
+                return emu_csinv_x_al;
+            case 15:
+                return emu_csinv_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CSNEG:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csneg_w_eq;
+            case 1:
+                return emu_csneg_w_ne;
+            case 2:
+                return emu_csneg_w_cs;
+            case 3:
+                return emu_csneg_w_cc;
+            case 4:
+                return emu_csneg_w_mi;
+            case 5:
+                return emu_csneg_w_pl;
+            case 6:
+                return emu_csneg_w_vs;
+            case 7:
+                return emu_csneg_w_vc;
+            case 8:
+                return emu_csneg_w_hi;
+            case 9:
+                return emu_csneg_w_ls;
+            case 10:
+                return emu_csneg_w_ge;
+            case 11:
+                return emu_csneg_w_lt;
+            case 12:
+                return emu_csneg_w_gt;
+            case 13:
+                return emu_csneg_w_le;
+            case 14:
+                return emu_csneg_w_al;
+            case 15:
+                return emu_csneg_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_csneg_x_eq;
+            case 1:
+                return emu_csneg_x_ne;
+            case 2:
+                return emu_csneg_x_cs;
+            case 3:
+                return emu_csneg_x_cc;
+            case 4:
+                return emu_csneg_x_mi;
+            case 5:
+                return emu_csneg_x_pl;
+            case 6:
+                return emu_csneg_x_vs;
+            case 7:
+                return emu_csneg_x_vc;
+            case 8:
+                return emu_csneg_x_hi;
+            case 9:
+                return emu_csneg_x_ls;
+            case 10:
+                return emu_csneg_x_ge;
+            case 11:
+                return emu_csneg_x_lt;
+            case 12:
+                return emu_csneg_x_gt;
+            case 13:
+                return emu_csneg_x_le;
+            case 14:
+                return emu_csneg_x_al;
+            case 15:
+                return emu_csneg_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_UDIV:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_udiv_w;
+        case 64:
+            return emu_udiv_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SDIV:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_sdiv_w;
+        case 64:
+            return emu_sdiv_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_LSLV:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_lslv_w;
+        case 64:
+            return emu_lslv_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_LSRV:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_lsrv_w;
+        case 64:
+            return emu_lsrv_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ASRV:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_asrv_w;
+        case 64:
+            return emu_asrv_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_RORV:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_rorv_w;
+        case 64:
+            return emu_rorv_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CRC32B:
+        return emu_crc32b_w;
+    case ARM64_INST_CRC32H:
+        return emu_crc32h_w;
+    case ARM64_INST_CRC32W:
+        return emu_crc32w_w;
+    case ARM64_INST_CRC32X:
+        return emu_crc32x_x;
+    case ARM64_INST_CRC32CB:
+        return emu_crc32cb_w;
+    case ARM64_INST_CRC32CH:
+        return emu_crc32ch_w;
+    case ARM64_INST_CRC32CW:
+        return emu_crc32cw_w;
+    case ARM64_INST_CRC32CX:
+        return emu_crc32cx_x;
+    case ARM64_INST_SMAX_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_smax_register_w;
+        case 64:
+            return emu_smax_register_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_UMAX_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_umax_register_w;
+        case 64:
+            return emu_umax_register_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SMIN_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_smin_register_w;
+        case 64:
+            return emu_smin_register_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_UMIN_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_umin_register_w;
+        case 64:
+            return emu_umin_register_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_MADD:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_madd_w;
+        case 64:
+            return emu_madd_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_MSUB:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_msub_w;
+        case 64:
+            return emu_msub_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_SMADDL:
+        return emu_smaddl_x;
+    case ARM64_INST_SMSUBL:
+        return emu_smsubl_x;
+    case ARM64_INST_SMULH:
+        return emu_smulh_x;
+    case ARM64_INST_UMADDL:
+        return emu_umaddl_x;
+    case ARM64_INST_UMSUBL:
+        return emu_umsubl_x;
+    case ARM64_INST_UMULH:
+        return emu_umulh_x;
+    case ARM64_INST_CCMN_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmn_register_w_eq;
+            case 1:
+                return emu_ccmn_register_w_ne;
+            case 2:
+                return emu_ccmn_register_w_cs;
+            case 3:
+                return emu_ccmn_register_w_cc;
+            case 4:
+                return emu_ccmn_register_w_mi;
+            case 5:
+                return emu_ccmn_register_w_pl;
+            case 6:
+                return emu_ccmn_register_w_vs;
+            case 7:
+                return emu_ccmn_register_w_vc;
+            case 8:
+                return emu_ccmn_register_w_hi;
+            case 9:
+                return emu_ccmn_register_w_ls;
+            case 10:
+                return emu_ccmn_register_w_ge;
+            case 11:
+                return emu_ccmn_register_w_lt;
+            case 12:
+                return emu_ccmn_register_w_gt;
+            case 13:
+                return emu_ccmn_register_w_le;
+            case 14:
+                return emu_ccmn_register_w_al;
+            case 15:
+                return emu_ccmn_register_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmn_register_x_eq;
+            case 1:
+                return emu_ccmn_register_x_ne;
+            case 2:
+                return emu_ccmn_register_x_cs;
+            case 3:
+                return emu_ccmn_register_x_cc;
+            case 4:
+                return emu_ccmn_register_x_mi;
+            case 5:
+                return emu_ccmn_register_x_pl;
+            case 6:
+                return emu_ccmn_register_x_vs;
+            case 7:
+                return emu_ccmn_register_x_vc;
+            case 8:
+                return emu_ccmn_register_x_hi;
+            case 9:
+                return emu_ccmn_register_x_ls;
+            case 10:
+                return emu_ccmn_register_x_ge;
+            case 11:
+                return emu_ccmn_register_x_lt;
+            case 12:
+                return emu_ccmn_register_x_gt;
+            case 13:
+                return emu_ccmn_register_x_le;
+            case 14:
+                return emu_ccmn_register_x_al;
+            case 15:
+                return emu_ccmn_register_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CCMP_REGISTER:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmp_register_w_eq;
+            case 1:
+                return emu_ccmp_register_w_ne;
+            case 2:
+                return emu_ccmp_register_w_cs;
+            case 3:
+                return emu_ccmp_register_w_cc;
+            case 4:
+                return emu_ccmp_register_w_mi;
+            case 5:
+                return emu_ccmp_register_w_pl;
+            case 6:
+                return emu_ccmp_register_w_vs;
+            case 7:
+                return emu_ccmp_register_w_vc;
+            case 8:
+                return emu_ccmp_register_w_hi;
+            case 9:
+                return emu_ccmp_register_w_ls;
+            case 10:
+                return emu_ccmp_register_w_ge;
+            case 11:
+                return emu_ccmp_register_w_lt;
+            case 12:
+                return emu_ccmp_register_w_gt;
+            case 13:
+                return emu_ccmp_register_w_le;
+            case 14:
+                return emu_ccmp_register_w_al;
+            case 15:
+                return emu_ccmp_register_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmp_register_x_eq;
+            case 1:
+                return emu_ccmp_register_x_ne;
+            case 2:
+                return emu_ccmp_register_x_cs;
+            case 3:
+                return emu_ccmp_register_x_cc;
+            case 4:
+                return emu_ccmp_register_x_mi;
+            case 5:
+                return emu_ccmp_register_x_pl;
+            case 6:
+                return emu_ccmp_register_x_vs;
+            case 7:
+                return emu_ccmp_register_x_vc;
+            case 8:
+                return emu_ccmp_register_x_hi;
+            case 9:
+                return emu_ccmp_register_x_ls;
+            case 10:
+                return emu_ccmp_register_x_ge;
+            case 11:
+                return emu_ccmp_register_x_lt;
+            case 12:
+                return emu_ccmp_register_x_gt;
+            case 13:
+                return emu_ccmp_register_x_le;
+            case 14:
+                return emu_ccmp_register_x_al;
+            case 15:
+                return emu_ccmp_register_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CCMN_IMMEDIATE:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmn_immediate_w_eq;
+            case 1:
+                return emu_ccmn_immediate_w_ne;
+            case 2:
+                return emu_ccmn_immediate_w_cs;
+            case 3:
+                return emu_ccmn_immediate_w_cc;
+            case 4:
+                return emu_ccmn_immediate_w_mi;
+            case 5:
+                return emu_ccmn_immediate_w_pl;
+            case 6:
+                return emu_ccmn_immediate_w_vs;
+            case 7:
+                return emu_ccmn_immediate_w_vc;
+            case 8:
+                return emu_ccmn_immediate_w_hi;
+            case 9:
+                return emu_ccmn_immediate_w_ls;
+            case 10:
+                return emu_ccmn_immediate_w_ge;
+            case 11:
+                return emu_ccmn_immediate_w_lt;
+            case 12:
+                return emu_ccmn_immediate_w_gt;
+            case 13:
+                return emu_ccmn_immediate_w_le;
+            case 14:
+                return emu_ccmn_immediate_w_al;
+            case 15:
+                return emu_ccmn_immediate_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmn_immediate_x_eq;
+            case 1:
+                return emu_ccmn_immediate_x_ne;
+            case 2:
+                return emu_ccmn_immediate_x_cs;
+            case 3:
+                return emu_ccmn_immediate_x_cc;
+            case 4:
+                return emu_ccmn_immediate_x_mi;
+            case 5:
+                return emu_ccmn_immediate_x_pl;
+            case 6:
+                return emu_ccmn_immediate_x_vs;
+            case 7:
+                return emu_ccmn_immediate_x_vc;
+            case 8:
+                return emu_ccmn_immediate_x_hi;
+            case 9:
+                return emu_ccmn_immediate_x_ls;
+            case 10:
+                return emu_ccmn_immediate_x_ge;
+            case 11:
+                return emu_ccmn_immediate_x_lt;
+            case 12:
+                return emu_ccmn_immediate_x_gt;
+            case 13:
+                return emu_ccmn_immediate_x_le;
+            case 14:
+                return emu_ccmn_immediate_x_al;
+            case 15:
+                return emu_ccmn_immediate_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CCMP_IMMEDIATE:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmp_immediate_w_eq;
+            case 1:
+                return emu_ccmp_immediate_w_ne;
+            case 2:
+                return emu_ccmp_immediate_w_cs;
+            case 3:
+                return emu_ccmp_immediate_w_cc;
+            case 4:
+                return emu_ccmp_immediate_w_mi;
+            case 5:
+                return emu_ccmp_immediate_w_pl;
+            case 6:
+                return emu_ccmp_immediate_w_vs;
+            case 7:
+                return emu_ccmp_immediate_w_vc;
+            case 8:
+                return emu_ccmp_immediate_w_hi;
+            case 9:
+                return emu_ccmp_immediate_w_ls;
+            case 10:
+                return emu_ccmp_immediate_w_ge;
+            case 11:
+                return emu_ccmp_immediate_w_lt;
+            case 12:
+                return emu_ccmp_immediate_w_gt;
+            case 13:
+                return emu_ccmp_immediate_w_le;
+            case 14:
+                return emu_ccmp_immediate_w_al;
+            case 15:
+                return emu_ccmp_immediate_w_nv;
+            default:
+                return NULL;
+            }
+        case 64:
+            switch (decoded->condition)
+            {
+            case 0:
+                return emu_ccmp_immediate_x_eq;
+            case 1:
+                return emu_ccmp_immediate_x_ne;
+            case 2:
+                return emu_ccmp_immediate_x_cs;
+            case 3:
+                return emu_ccmp_immediate_x_cc;
+            case 4:
+                return emu_ccmp_immediate_x_mi;
+            case 5:
+                return emu_ccmp_immediate_x_pl;
+            case 6:
+                return emu_ccmp_immediate_x_vs;
+            case 7:
+                return emu_ccmp_immediate_x_vc;
+            case 8:
+                return emu_ccmp_immediate_x_hi;
+            case 9:
+                return emu_ccmp_immediate_x_ls;
+            case 10:
+                return emu_ccmp_immediate_x_ge;
+            case 11:
+                return emu_ccmp_immediate_x_lt;
+            case 12:
+                return emu_ccmp_immediate_x_gt;
+            case 13:
+                return emu_ccmp_immediate_x_le;
+            case 14:
+                return emu_ccmp_immediate_x_al;
+            case 15:
+                return emu_ccmp_immediate_x_nv;
+            default:
+                return NULL;
+            }
+        default:
+            return NULL;
+        }
+    case ARM64_INST_RBIT:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_rbit_w;
+        case 64:
+            return emu_rbit_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_REV16:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_rev16_w;
+        case 64:
+            return emu_rev16_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_REV32:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_rev_w;
+        case 64:
+            return emu_rev32_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_REV64:
+        return emu_rev_x;
+    case ARM64_INST_CLZ:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_clz_w;
+        case 64:
+            return emu_clz_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CLS:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_cls_w;
+        case 64:
+            return emu_cls_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CTZ:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_ctz_w;
+        case 64:
+            return emu_ctz_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_CNT:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_cnt_w;
+        case 64:
+            return emu_cnt_x;
+        default:
+            return NULL;
+        }
+    case ARM64_INST_ABS:
+        switch (decoded->operand_width)
+        {
+        case 32:
+            return emu_abs_w;
+        case 64:
+            return emu_abs_x;
+        default:
+            return NULL;
+        }
     default:
-
         return NULL;
-
     }
-
-}
-
-/* ======================== 数据处理寄存器类：解码结果构建缓存条目 ======================== */
-
-bool emu_build_register_executor(const struct arm64_decoded_instruction *decoded, struct arm64_executor_entry *entry)
-{
-    bool multiply;
-    bool conditional_compare;
-    bool unary;
-
-    entry->execute = emu_select_register_executor(decoded);
-    if (!entry->execute) return false;
-
-    multiply = decoded->instruction == ARM64_INSN_MADD || decoded->instruction == ARM64_INSN_MSUB || decoded->instruction == ARM64_INSN_SMADDL || decoded->instruction == ARM64_INSN_SMSUBL || decoded->instruction == ARM64_INSN_SMULH || decoded->instruction == ARM64_INSN_UMADDL || decoded->instruction == ARM64_INSN_UMSUBL || decoded->instruction == ARM64_INSN_UMULH;
-    conditional_compare = decoded->instruction == ARM64_INSN_CCMN_REGISTER || decoded->instruction == ARM64_INSN_CCMP_REGISTER || decoded->instruction == ARM64_INSN_CCMN_IMMEDIATE || decoded->instruction == ARM64_INSN_CCMP_IMMEDIATE;
-    unary = decoded->instruction == ARM64_INSN_RBIT || decoded->instruction == ARM64_INSN_REV16 || decoded->instruction == ARM64_INSN_REV32 || decoded->instruction == ARM64_INSN_REV64 || decoded->instruction == ARM64_INSN_CLZ || decoded->instruction == ARM64_INSN_CLS || decoded->instruction == ARM64_INSN_CTZ || decoded->instruction == ARM64_INSN_CNT || decoded->instruction == ARM64_INSN_ABS;
-
-    entry->operand0 = decoded->immediate;
-    entry->reg0 = decoded->rn;
-    entry->reg1 = unary ? decoded->rd : decoded->rm;
-    entry->reg2 = multiply ? decoded->ra : conditional_compare ? decoded->condition : decoded->rd;
-    entry->reg3 = multiply ? decoded->rd : conditional_compare ? decoded->nzcv : decoded->condition;
-    entry->option0 = decoded->shift_amount;
-    return true;
 }

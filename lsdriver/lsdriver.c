@@ -1,8 +1,10 @@
-﻿
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/task_stack.h>
+#include <linux/atomic.h>
 #include <uapi/linux/sched/types.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
@@ -14,10 +16,12 @@
 #include <linux/kobject.h>
 #include <linux/kallsyms.h>
 
-#include "io_struct.h"
+#include "io_version/io_struct.h"
 #include "export_fun.h"
 #include "inline_hook_frame.h"
-#include "lsdriver_log.h"
+#include "klog/lsdriver_log.h"
+#include "io_version/version.h"
+#include "hide_proc.h"
 #include "hide_task.h"
 #include "hide_kgsl.h"
 #include "arm64_syscall_monitor.h"
@@ -30,6 +34,7 @@
 #include "virtual_memory_rw.h"
 #include "virtual_memory_enum.h"
 #include "break_point.h"
+#include "network/ipv4_ping.h"
 
 static struct request_obj *req = NULL;
 
@@ -38,6 +43,8 @@ volatile 约束，这三个指针的每次读写都按易变访问处理，
 适合在线程循环中持续轮询生命周期状态。
 不约束指针指向内存地址
 
+volatile struct task_struct * ls_process_task = 0;错误：指向 是volatile 数据 的指针， 赋值给普通指针会报错，这里是指向结构体数据
+struct task_struct *volatile ls_process_task = ...; // 正确：指针变量本身是 volatile
 */
 struct task_struct *volatile connect_thread_task = 0;
 struct task_struct *volatile dispatch_thread_task = 0;
@@ -51,76 +58,95 @@ static int DispatchThreadFunction(void *data)
     {
         if (ls_process_task)
         {
-            if (req->kernel) // 确实有任务
+            /*
+            不使用__atomic_exchange_n 是性能问题：
+            内核轮询到部分时没任务会反复执行swpa wzr, w8, [addr]交换，开销比只读大几倍
+            有持续任务的话使用__atomic_exchange_n快
+            现在的情况是5000次外的睡眠不管吧，请求低的下70%时间都轮询到睡眠了上了，睡眠没啥好说的
+            在5000次内可能1300次轮询后才有实际请求到，或者3400次才到
+            5000次全空是这情况，有持续任务还是__atomic_exchange_n快
+            设备	exchange：swpa	load：ldar
+            RMX3888	5.70–6.20 ns/轮	0.43–0.46 ns/轮
+            PCAM00	122.90–145.72 ns/轮	1.10 1.15 ns/轮
+            */
+            if (__atomic_load_n(&req->kernel, __ATOMIC_ACQUIRE)) // 确实有任务
             {
                 // 有活干，重置计数器
                 spin_count = 0;
 
-                req->kernel = false; // 清除请求标志
+                __atomic_store_n(&req->kernel, 0, __ATOMIC_RELAXED); // 清除请求标志
 
-                switch (req->op) // 派发
+                enum request_op op = __atomic_load_n(&req->op, __ATOMIC_RELAXED);
+
+                switch (op) // 派发
                 {
                 case request_op_none:
                     break;
                 case request_op_vmem_read:
                 case request_op_vmem_write:
-                    req->status = virtual_memory_rw(req->op, req->tgid, req->vmemrw_info.rw_addr, &req->vmemrw_info.user_buffer, req->vmemrw_info.size);
+                    __atomic_store_n(&req->status, virtual_memory_rw(op, req->tgid, req->vmemrw_info.rw_addr, &req->vmemrw_info.user_buffer, req->vmemrw_info.size), __ATOMIC_RELAXED);
                     break;
                 case request_op_vmem_info:
-                    req->status = virtual_memory_enum(req->tgid, &req->vmem_info);
+                    __atomic_store_n(&req->status, virtual_memory_enum(req->tgid, &req->vmem_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_touch_init:
-                    req->status = v_touch_init(req->vinput_info.request_virtual_slots, &req->vinput_info.POSITION_X, &req->vinput_info.POSITION_Y);
+                    __atomic_store_n(&req->status, v_touch_init(req->vinput_info.request_virtual_slots, &req->vinput_info.POSITION_X, &req->vinput_info.POSITION_Y), __ATOMIC_RELAXED);
                     break;
                 case request_op_touch_down:
                 case request_op_touch_move:
                 case request_op_touch_up:
-                    v_touch_event(req->op, req->vinput_info.slot, req->vinput_info.x, req->vinput_info.y);
+                    v_touch_event(op, req->vinput_info.slot, req->vinput_info.x, req->vinput_info.y);
                     break;
                 case request_op_gyro_init:
-                    req->status = v_gyro_init();
+                    __atomic_store_n(&req->status, v_gyro_init(), __ATOMIC_RELAXED);
                     break;
                 case request_op_gyro_report:
-                    req->status = v_gyro_report(req->vgyro_info.gyro_x_mrad_s, req->vgyro_info.gyro_y_mrad_s, req->vgyro_info.gyro_z_mrad_s);
+                    __atomic_store_n(&req->status, v_gyro_report(req->vgyro_info.gyro_x_mrad_s, req->vgyro_info.gyro_y_mrad_s, req->vgyro_info.gyro_z_mrad_s), __ATOMIC_RELAXED);
                     break;
                 case request_op_gnss_init:
-                    req->status = v_gnss_init();
+                    __atomic_store_n(&req->status, v_gnss_init(), __ATOMIC_RELAXED);
                     break;
                 case request_op_gnss_report:
-                    req->status = v_gnss_report(req->vgnss_info.latitude_e7, req->vgnss_info.longitude_e7);
+                    __atomic_store_n(&req->status, v_gnss_report(req->vgnss_info.latitude_e7, req->vgnss_info.longitude_e7), __ATOMIC_RELAXED);
                     break;
                 case request_op_hwbp_set:
-                    req->status = set_process_hwbp(&req->bp_info);
+                    __atomic_store_n(&req->status, set_process_hwbp(&req->bp_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_hwbp_remove:
                     remove_process_hwbp();
                     break;
                 case request_op_ptebp_set:
-                    req->status = set_process_ptebp(&req->bp_info);
+                    __atomic_store_n(&req->status, set_process_ptebp(&req->bp_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_ptebp_remove:
                     remove_process_ptebp();
                     break;
                 case request_op_stepbp_set:
-                    req->status = set_process_stepbp(&req->bp_info);
+                    __atomic_store_n(&req->status, set_process_stepbp(&req->bp_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_stepbp_remove:
                     remove_process_stepbp();
                     break;
+                case request_op_dptdbg_set:
+                    __atomic_store_n(&req->status, set_process_dptdbg(&req->bp_info), __ATOMIC_RELAXED);
+                    break;
+                case request_op_dptdbg_remove:
+                    remove_process_dptdbg();
+                    break;
                 case request_op_syscall_monitor_set:
-                    req->status = syscall_monitor_install(req->tgid);
+                    __atomic_store_n(&req->status, syscall_monitor_install(req->tgid), __ATOMIC_RELAXED);
                     break;
                 case request_op_syscall_monitor_remove:
                     syscall_monitor_remove(req->tgid);
                     break;
                 case request_op_cntvct_monitor_set:
-                    req->status = cntvct_monitor_install(req->tgid);
+                    __atomic_store_n(&req->status, cntvct_monitor_install(req->tgid), __ATOMIC_RELAXED);
                     break;
                 case request_op_cntvct_monitor_remove:
                     cntvct_monitor_remove(req->tgid);
                     break;
                 case request_op_env_get_params:
-                    req->status = get_env_params(req->tgid, req->env_info.thread_name, &req->env_info.tpidr_el0, &req->env_info.pacga_lo, &req->env_info.pacga_hi, &req->env_info.tls_status, &req->env_info.pacga_status);
+                    __atomic_store_n(&req->status, get_env_params(req->tgid, req->env_info.thread_name, &req->env_info.tpidr_el0, &req->env_info.pacga_lo, &req->env_info.pacga_hi, &req->env_info.tls_status, &req->env_info.pacga_status), __ATOMIC_RELAXED);
                     break;
                 case request_op_kernel_exit:
                     hide_task_remove(connect_thread_task->pid);
@@ -131,7 +157,7 @@ static int DispatchThreadFunction(void *data)
                 default:
                     break;
                 }
-                req->user = true; // 通知用户层完成
+                __atomic_store_n(&req->user, 1, __ATOMIC_RELEASE); // 通知用户层完成
             }
             else
             {
@@ -141,7 +167,7 @@ static int DispatchThreadFunction(void *data)
                 if (spin_count < 5000)
                 {
                     spin_count++;
-                    cpu_relax(); // 告诉 CPU 我在忙等，降低功耗
+                    //cpu_relax(); // arm64下yield等同于nop
                 }
                 else
                 {
@@ -165,6 +191,7 @@ static int DispatchThreadFunction(void *data)
 static int ConnectThreadFunction(void *data)
 {
     struct task_struct *task;
+    struct task_struct *old_task;
     struct mm_struct *mm = NULL;
     struct page **pages = NULL;
     int num_pages;
@@ -182,7 +209,8 @@ static int ConnectThreadFunction(void *data)
             // 这次的task是旧task跳过
             if (task == ls_process_task) continue;
             // 这次的task启动时间小于旧task跳过
-            if (ls_process_task && task->start_time <= ls_process_task->start_time) continue;
+            old_task = ls_process_task;
+            if (old_task && task->start_time <= old_task->start_time) continue;
 
             // 获取进程的内存描述符
             mm = get_task_mm(task);
@@ -195,13 +223,15 @@ static int ConnectThreadFunction(void *data)
             pages = kmalloc_array(num_pages, sizeof(struct page *), GFP_KERNEL);
             if (!pages)
             {
-                ls_log_tag("core", "kmalloc_array 失败\n");
+                ls_log_always_tag("core", "kmalloc_array 失败\n");
                 goto out_put_mm;
             }
 
             // 远程获取用户空间地址对应的物理页（将用户地址映射到内核）
             mmap_read_lock(mm);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) // 内核 6.12
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0) // 内核 6.18 及以上
+            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) // 内核 6.12 到 6.18
             ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)  // 内核 6.5 到 6.12
             ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
@@ -216,7 +246,7 @@ static int ConnectThreadFunction(void *data)
 
             if (ret < num_pages)
             {
-                ls_log_tag("core", "get_user_pages_remote 失败, ret=%d\n", ret);
+                ls_log_always_tag("core", "get_user_pages_remote 失败, ret=%d\n", ret);
                 goto out_put_pages;
             }
 
@@ -224,16 +254,17 @@ static int ConnectThreadFunction(void *data)
             req = vmap(pages, num_pages, VM_MAP, PAGE_KERNEL);
             if (!req)
             {
-                ls_log_tag("core", "vmap 失败\n");
+                ls_log_always_tag("core", "vmap 失败\n");
                 goto out_put_pages;
             }
-            if (ls_process_task) send_sig(SIGKILL, ls_process_task, 0); // 杀死旧的task
+            old_task = ls_process_task;
+            if (old_task && !(READ_ONCE(old_task->flags) & PF_EXITING)) send_sig(SIGKILL, old_task, 0); // 杀死旧的task线程组
 
             // 成功 get_user_pages_remote 持有页面引用，只需释放 mm
-            ls_process_task = task;        // 保存用户进程指针
-            req->user = true;              // 通知用户层已连接
-            hide_task_install(task->tgid); // 隐藏进程
-            hide_kgsl_install(task->tgid); // 隐藏高通GPU节点
+            ls_process_task = task;                            // 保存用户进程指针
+            __atomic_store_n(&req->user, 1, __ATOMIC_RELEASE); // 通知用户层已连接
+            hide_task_install(task->tgid);                     // 隐藏进程
+            hide_kgsl_install(task->tgid);                     // 隐藏高通GPU节点
             kfree(pages);
             pages = NULL;
             mmput(mm);
@@ -241,7 +272,7 @@ static int ConnectThreadFunction(void *data)
             break; // 找到目标进程，退出遍历
 
         out_put_pages:
-            release_gup_pages(pages, ret);
+            if (ret > 0) release_pages(pages, ret);
             kfree(pages);
             pages = NULL;
 
@@ -256,10 +287,28 @@ static int ConnectThreadFunction(void *data)
     return 0;
 }
 
+//去掉 ARM64 内核返回地址中的指针认证码（PAC）
+static inline unsigned long exit_strip_kernel_pac(unsigned long address)
+{
+#ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
+    register unsigned long stripped_address asm("x30") = address;
+
+    /*
+    xpaci x0    // 移除任意寄存器中“指令指针”类型的 PAC
+    xpacd x0    // 移除任意寄存器中“数据指针”类型的 PAC
+    xpaclri     // 专门移除 x30/LR 中的指令 PAC
+    */
+    asm("hint #7" : "+r"(stripped_address)); //XPACLRI指令
+    return stripped_address;
+#else
+    return address;
+#endif
+}
+
 static const char *exit_watch_process_name(const char *comm)
 {
     static const char *const process_names[] = {
-        "LS", "com.tencent.tmgp.dfm", "com.tencent.tmgp.sgame", "com.pi.czrxdfirst", "com.bwxrk.yqmy.gz", "me.hd.ggtutorial",
+        "LS", "system_server", "surfaceflinger", "com.tencent.tmgp.dfm", "com.tencent.tmgp.sgame", "com.pi.czrxdfirst", "com.bwxrk.yqmy.gz", "me.hd.ggtutorial",
     };
 
     for (int i = 0; i < ARRAY_SIZE(process_names); i++)
@@ -335,30 +384,14 @@ static const char *exit_fault_code_name(unsigned int signal, int code)
     return "UNKNOWN";
 }
 
-struct exit_kernel_frame_record
+static inline unsigned long long next_process_event_id(void)
 {
-    unsigned long previous_fp;
-    unsigned long return_address;
-};
-//去掉 ARM64 内核返回地址中的指针认证码（PAC）
-static inline unsigned long exit_strip_kernel_pac(unsigned long address)
-{
-#ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
-    register unsigned long stripped_address asm("x30") = address;
+    static uint64_t process_event_sequence;
 
-    /*
-    xpaci x0    // 移除任意寄存器中“指令指针”类型的 PAC
-    xpacd x0    // 移除任意寄存器中“数据指针”类型的 PAC
-    xpaclri     // 专门移除 x30/LR 中的指令 PAC
-    */
-    asm("hint #7" : "+r"(stripped_address)); //XPACLRI指令
-    return stripped_address;
-#else
-    return address;
-#endif
+    return __atomic_add_fetch(&process_event_sequence, 1, __ATOMIC_RELAXED);
 }
-
-static void log_exit_kernel_chain(const char *tag, const struct pt_regs *regs)
+//当前 hook 被调用时，内核是通过哪些函数一路调用到这里的。 它记录的是内核调用栈
+static void log_exit_kernel_chain(const char *tag, unsigned long long event_id, const struct pt_regs *regs)
 {
     unsigned long stack_low = (unsigned long)task_stack_page(current);
     unsigned long stack_high = stack_low + THREAD_SIZE;
@@ -366,29 +399,33 @@ static void log_exit_kernel_chain(const char *tag, const struct pt_regs *regs)
     unsigned long address = exit_strip_kernel_pac(regs->regs[30]);
     unsigned int depth = 0;
 
-    if (address) ls_log_always_tag(tag, "frame=%02u address=%pS\n", depth++, (void *)address);
+    if (address) ls_log_always_tag(tag, "event=%llu frame=%02u address=%pS\n", event_id, depth++, (void *)address);
 
     while (depth < sizeof(uint64_t))
     {
-        const struct exit_kernel_frame_record *frame;
+        const unsigned long *frame = (const unsigned long *)frame_pointer;
         unsigned long previous_fp;
 
-        if ((frame_pointer & 0xf) || frame_pointer < stack_low || frame_pointer > stack_high - sizeof(*frame)) break;
+        if ((frame_pointer & 0xf) || frame_pointer < stack_low || frame_pointer > stack_high - 2 * sizeof(*frame)) break;
 
-        frame = (const struct exit_kernel_frame_record *)frame_pointer;
-        previous_fp = READ_ONCE(frame->previous_fp);
-        address = exit_strip_kernel_pac(READ_ONCE(frame->return_address));
-        if (address) ls_log_always_tag(tag, "frame=%02u address=%pS\n", depth++, (void *)address);
+        previous_fp = READ_ONCE(frame[0]);
+        address = exit_strip_kernel_pac(READ_ONCE(frame[1]));
+        if (address) ls_log_always_tag(tag, "event=%llu frame=%02u address=%pS\n", event_id, depth++, (void *)address);
 
         if (previous_fp <= frame_pointer) break;
         frame_pointer = previous_fp;
     }
 }
 
+/*
+arm64_force_sig_fault
+    -> 原始异常：ESR、fault 地址、信号、用户 PC/LR/SP
+*/
 static int arm64_force_sig_fault_hook_work(struct pt_regs *regs)
 {
     struct task_struct *task = current;
     char process_comm[TASK_COMM_LEN];
+    char thread_comm[TASK_COMM_LEN];
 
     get_task_comm(process_comm, task->group_leader);
     const char *process_name = exit_watch_process_name(process_comm);
@@ -398,63 +435,130 @@ static int arm64_force_sig_fault_hook_work(struct pt_regs *regs)
     const char *source = (const char *)(uintptr_t)regs->regs[3];
     unsigned int signal = (unsigned int)regs->regs[0];
     int code = (int)regs->regs[1];
-    ls_log_always_tag("fault", "process=%s thread=%s tgid=%d tid=%d signal=%s(%u) si_code=%s(%d) addr=0x%lx esr=0x%lx source=%s pc=0x%llx lr=0x%llx sp=0x%llx\n", process_name, task->comm, task->tgid, task->pid, exit_signal_name(signal), signal, exit_fault_code_name(signal, code), code, (unsigned long)regs->regs[2], task->thread.fault_code, source ? source : "<none>", (unsigned long long)user_regs->pc, (unsigned long long)user_regs->regs[30], (unsigned long long)user_regs->sp);
-    log_exit_kernel_chain("fault", regs);
+    unsigned int signal_flags = READ_ONCE(task->signal->flags);
+    unsigned long long event_id = next_process_event_id();
+
+    get_task_comm(thread_comm, task);
+    ls_log_always_tag("fault", "event=%llu stage=fault_delivery process=%s process_start=%llu thread=%s thread_start=%llu tgid=%d tid=%d signal=%s(%u) si_code=%s(%d) addr=0x%lx esr=0x%lx source=%s pc=0x%llx lr=0x%llx sp=0x%llx group_exit=%u group_exit_code=0x%x pf_signaled=%u\n", event_id, process_name, (unsigned long long)READ_ONCE(task->group_leader->start_time), thread_comm, (unsigned long long)READ_ONCE(task->start_time), task->tgid, task->pid, exit_signal_name(signal), signal, exit_fault_code_name(signal, code), code, (unsigned long)regs->regs[2], task->thread.fault_code, source ? source : "<none>", (unsigned long long)user_regs->pc, (unsigned long long)user_regs->regs[30], (unsigned long long)user_regs->sp, !!(signal_flags & SIGNAL_GROUP_EXIT), READ_ONCE(task->signal->group_exit_code), !!(READ_ONCE(task->flags) & PF_SIGNALED));
+    log_exit_kernel_chain("fault", event_id, regs);
     return 0;
 }
 
-static void log_watched_process_exit(struct task_struct *task, const char *process_name, const struct pt_regs *regs)
+/*
+do_group_exit
+    -> 异常是否最终触发整个线程组退出、退出信号/状态
+*/
+static int do_group_exit_hook_work(struct pt_regs *regs)
 {
-    unsigned long code = regs->regs[0];
-    unsigned int signal = code & 0x7f;
+    struct task_struct *task = current;
+    struct pt_regs *user_regs = task_pt_regs(task);
+    char process_comm[TASK_COMM_LEN];
+    char thread_comm[TASK_COMM_LEN];
+    unsigned int requested_code = (unsigned int)regs->regs[0];
+    unsigned int signal_flags = READ_ONCE(task->signal->flags);
+    unsigned int group_exit_code = READ_ONCE(task->signal->group_exit_code);
+    unsigned int effective_code = requested_code;
+    unsigned int signal;
+    unsigned long long event_id;
+
+    get_task_comm(process_comm, task->group_leader);
+    const char *process_name = exit_watch_process_name(process_comm);
+    if (!process_name) return 0;
+
+    if (signal_flags & SIGNAL_GROUP_EXIT) effective_code = group_exit_code;
+
+    signal = effective_code & 0x7f;
+    event_id = next_process_event_id();
+    get_task_comm(thread_comm, task);
 
     if (signal)
     {
-        ls_log_always_tag("exit", "process=%s pid=%d signal=%s(%u) core_dump=%u\n", process_name, task->pid, exit_signal_name(signal), signal, !!(code & 0x80));
-        log_exit_kernel_chain("exit", regs);
+        ls_log_always_tag("group_exit", "event=%llu stage=group_exit process=%s process_start=%llu thread=%s thread_start=%llu tgid=%d tid=%d leader=%u requested_code=0x%x effective_code=0x%x signal=%s(%u) core_dump=%u already_exiting=%u pf_signaled=%u live_threads=%d pc=0x%llx lr=0x%llx sp=0x%llx\n", event_id, process_name, (unsigned long long)READ_ONCE(task->group_leader->start_time), thread_comm, (unsigned long long)READ_ONCE(task->start_time), task->tgid, task->pid, thread_group_leader(task), requested_code, effective_code, exit_signal_name(signal), signal, !!(effective_code & 0x80), !!(signal_flags & SIGNAL_GROUP_EXIT), !!(READ_ONCE(task->flags) & PF_SIGNALED), atomic_read(&task->signal->live), (unsigned long long)user_regs->pc, (unsigned long long)user_regs->regs[30], (unsigned long long)user_regs->sp);
     }
     else
     {
-        ls_log_always_tag("exit", "process=%s pid=%d status=%u\n", process_name, task->pid, (unsigned int)((code >> 8) & 0xff));
+        ls_log_always_tag("group_exit", "event=%llu stage=group_exit process=%s process_start=%llu thread=%s thread_start=%llu tgid=%d tid=%d leader=%u requested_code=0x%x effective_code=0x%x status=%u already_exiting=%u pf_signaled=%u live_threads=%d pc=0x%llx lr=0x%llx sp=0x%llx\n", event_id, process_name, (unsigned long long)READ_ONCE(task->group_leader->start_time), thread_comm, (unsigned long long)READ_ONCE(task->start_time), task->tgid, task->pid, thread_group_leader(task), requested_code, effective_code, (effective_code >> 8) & 0xff, !!(signal_flags & SIGNAL_GROUP_EXIT), !!(READ_ONCE(task->flags) & PF_SIGNALED), atomic_read(&task->signal->live), (unsigned long long)user_regs->pc, (unsigned long long)user_regs->regs[30], (unsigned long long)user_regs->sp);
     }
+
+    log_exit_kernel_chain("group_exit", event_id, regs);
+    return 0;
 }
 
-// do_exit 执行前的 inline hook 工作函数，返回 0 表示继续执行 do_exit
+/*
+do_exit
+    -> 每个线程实际进入不可返回的退出路径
+*/
 static int do_exit_hook_work(struct pt_regs *regs)
 {
-    // 调用 do_exit 的进程就是当前正在运行并准备死去的进程 (current)
     struct task_struct *task = current;
+    struct pt_regs *user_regs = task_pt_regs(task);
+    char process_comm[TASK_COMM_LEN];
+    char thread_comm[TASK_COMM_LEN];
+    unsigned long code = regs->regs[0];
+    unsigned int signal = code & 0x7f;
+    unsigned int signal_flags = READ_ONCE(task->signal->flags);
+    bool is_leader = thread_group_leader(task);
+
+    get_task_comm(process_comm, task->group_leader);
+    const char *process_name = exit_watch_process_name(process_comm);
+    if (process_name)
+    {
+        unsigned long long event_id = next_process_event_id();
+
+        get_task_comm(thread_comm, task);
+        if (signal)
+        {
+            ls_log_always_tag("exit", "event=%llu stage=thread_exit process=%s process_start=%llu thread=%s thread_start=%llu tgid=%d tid=%d leader=%u code=0x%lx signal=%s(%u) core_dump=%u group_exit=%u group_exit_code=0x%x pf_signaled=%u live_threads=%d pc=0x%llx lr=0x%llx sp=0x%llx\n", event_id, process_name, (unsigned long long)READ_ONCE(task->group_leader->start_time), thread_comm, (unsigned long long)READ_ONCE(task->start_time), task->tgid, task->pid, is_leader, code, exit_signal_name(signal), signal, !!(code & 0x80), !!(signal_flags & SIGNAL_GROUP_EXIT), READ_ONCE(task->signal->group_exit_code), !!(READ_ONCE(task->flags) & PF_SIGNALED), atomic_read(&task->signal->live), (unsigned long long)user_regs->pc, (unsigned long long)user_regs->regs[30], (unsigned long long)user_regs->sp);
+        }
+        else
+        {
+            ls_log_always_tag("exit", "event=%llu stage=thread_exit process=%s process_start=%llu thread=%s thread_start=%llu tgid=%d tid=%d leader=%u code=0x%lx status=%u group_exit=%u group_exit_code=0x%x pf_signaled=%u live_threads=%d pc=0x%llx lr=0x%llx sp=0x%llx\n", event_id, process_name, (unsigned long long)READ_ONCE(task->group_leader->start_time), thread_comm, (unsigned long long)READ_ONCE(task->start_time), task->tgid, task->pid, is_leader, code, (unsigned int)((code >> 8) & 0xff), !!(signal_flags & SIGNAL_GROUP_EXIT), READ_ONCE(task->signal->group_exit_code), !!(READ_ONCE(task->flags) & PF_SIGNALED), atomic_read(&task->signal->live), (unsigned long long)user_regs->pc, (unsigned long long)user_regs->regs[30], (unsigned long long)user_regs->sp);
+        }
+
+        if (signal || (signal_flags & SIGNAL_GROUP_EXIT) || is_leader) log_exit_kernel_chain("exit", event_id, regs);
+    }
+
+    return 0;
+}
+
+/*
+taskstats_exit(group_dead=true)
+    -> 确认最后线程退出，整个进程生命周期结束
+*/
+static int taskstats_exit_hook_work(struct pt_regs *regs)
+{
+    struct task_struct *task = (struct task_struct *)(uintptr_t)regs->regs[0];
+    //taskstats_exit 的 group_dead 由内核在 signal->live 递减后计算，非零表示当前是线程组最后一个退出线程。也是进程级退出了
+    bool group_dead = regs->regs[1] != 0;
     char process_comm[TASK_COMM_LEN];
 
-    // 只监听主线程的退出
-    if (!thread_group_leader(task)) return 0;
+    if (!group_dead) return 0;
 
-    get_task_comm(process_comm, task);
-    const char *process_name = exit_watch_process_name(process_comm);
-    if (process_name) log_watched_process_exit(task, process_name, regs);
+    get_task_comm(process_comm, task->group_leader);
 
     // 任意被监控目标退出时移除其 TGID，防止 PID 槽位和 do_el0_svc hook 残留。
     syscall_monitor_remove(task->tgid);
     cntvct_monitor_remove(task->tgid);
 
     // 仅匹配用户态通过 PR_SET_NAME 设置的精确进程名。
-    if (__builtin_strcmp(task->comm, "LS") == 0)
+    if (__builtin_strcmp(process_comm, "LS") == 0)
     {
-        ls_log_tag("core", "【进程监听】检测到 LS 进程即将退出！PID: %d, 进程名(comm): %s\n", task->pid, task->comm);
-
         // 相应处理
 
         hide_task_remove(task->tgid); // 只取消当前用户进程的隐藏，不影响隐藏的内核线程
         hide_kgsl_remove(task->tgid); // 取消当前用户进程的高通GPU节点隐藏
-        v_touch_destroy();            // 清理触摸
-        v_gnss_destroy();             // 清理定位
-        v_gyro_destroy();             // 清理陀螺仪
-        remove_process_hwbp();        // 清理硬件断点
-        remove_process_ptebp();       // 清理 PTEBP
-        remove_process_stepbp();      // 清理单步断点
-        syscall_monitor_remove_all(); // 清理全部系统调用监控目标
-        cntvct_monitor_remove(0);     // 清理 CNTVCT_EL0 读取监控
-        ls_process_task = NULL;       // 标记用户进程已断开
+
+        v_touch_destroy();                // 清理触摸
+        v_gnss_destroy();                 // 清理定位
+        v_gyro_destroy();                 // 清理陀螺仪
+        remove_process_hwbp();            // 清理硬件断点
+        remove_process_ptebp();           // 清理 PTEBP
+        remove_process_dptdbg();          // 清理 DPTDBG
+        remove_process_stepbp();          // 清理单步断点
+        syscall_monitor_remove_all();     // 清理全部系统调用监控目标
+        cntvct_monitor_remove_all();      // 清理全部 CNTVCT_EL0 读取监控
+        virtual_memory_rw(0, 0, 0, 0, 0); // 清理缓存 mm 引用
+        ls_process_task = NULL;           // 标记用户进程已断开
         if (!connect_thread_task && !dispatch_thread_task)
         {
             inline_hook_remove_all(); // 内核退出才清理所有hook
@@ -462,18 +566,39 @@ static int do_exit_hook_work(struct pt_regs *regs)
     }
     return 0;
 }
+
 static int do_exit_init(void)
 {
+    /*
+    arm64_force_sig_fault -> 记录原始异常
+    do_group_exit         -> 记录谁发起整个进程退出及原因
+    do_exit               -> 记录实际线程退出
+    taskstats_exit        -> 在线程组最后一个线程退出时执行资源清理
+    主线程很可能只做资源初始化和线程初始化就退出了，所以不能只看主线程退出就清理驱动相关资源，
+    之前在do_exit_hook_work中看主线程退出清理很错误，现在改为taskstats_exit_hook_work在线程组最后一个线程退出时执行资源清理
+    使用 "nohup dmesg -w > /storage/emulated/0/dmesg.txt 2>/dev/null &"查看日志
+    /sdcard是软链接（快捷方式）/storage/emulated/0 是真实挂载点，两者最终指向同一块内置闪存/data/media/0，内容完全一致。
+    */
+    static struct hook_entry taskstats_exit_hooks[] = {
+        HOOK_ENTRY("taskstats_exit", taskstats_exit_hook_work),
+    };
     static struct hook_entry exit_hooks[] = {
         HOOK_ENTRY("arm64_force_sig_fault", arm64_force_sig_fault_hook_work),
+        HOOK_ENTRY("do_group_exit", do_group_exit_hook_work),
         HOOK_ENTRY("do_exit", do_exit_hook_work),
     };
-
-    int ret = inline_hook_install(exit_hooks);
+    //taskstats_exit必须hook成功，主要服务于连接进程退出的资源清理，其他3个hook是无关紧要的崩溃日志hook
+    int ret = inline_hook_install(taskstats_exit_hooks);
     if (ret < 0)
     {
-        ls_log_tag("core", "安装进程异常/退出 inline hook 失败，错误码: %d\n", ret);
+        ls_log_always_tag("core", "安装 taskstats_exit 清理 hook 失败，错误码: %d\n", ret);
         return ret;
+    }
+
+    ret = inline_hook_install(exit_hooks);
+    if (ret < 0)
+    {
+        ls_log_always_tag("core", "安装进程异常/退出诊断 hook 失败，诊断组已回滚，taskstats_exit 清理 hook 保留，错误码: %d\n", ret);
     }
 
     return 0;
@@ -484,7 +609,38 @@ static void hide_myself(void)
 {
     // 内核模块结构体
     struct module_use *use, *tmp;
-    // 小于内核 6.12才能隐藏vmap_area_list和_vmap_area_root，高版本移除了这个数据结构，由https://github.com/wenyounb，发现
+
+    /*
+
+    2026/9/30/10/40已重新核对的5.10、5.15 6.1、6.6 源码使用全局 vmap_area_list 和 vmap_area_root 管理在用区域；
+    6.12、6.18 改为分节点管理，
+
+    旧版内核全局变量，
+    vmap_area_list	链表头	    按地址顺序遍历区域
+    vmap_area_root	红黑树根	根据地址快速查找区域
+    内核虚拟地址区域的结构体:
+    struct vmap_area {
+    unsigned long va_start;
+    unsigned long va_end;
+    struct rb_node rb_node;  // 加入红黑树
+    struct list_head list;   // 加入链表
+    // 其他字段
+    };
+                        
+    同一批 vmap_area 对象
+    vmap_area_list → 通过各区域的 list 成员串成链表
+    vmap_area_root → 通过各区域的 rb_node 成员组成红黑树
+    一份数据、两种查找方式。
+
+    */
+
+    /*
+    不同版本判断链由https://github.com/wenyounb提交
+    停用：vmap_area_list/vmap_area_root 是内核 vmap 虚拟地址区域的管理索引，并非仅用于信息展示。
+    这套机制服务于 vmalloc/vzalloc、vmap、常规动态 ioremap，以及使用该机制的模块内存分配路径。
+    此处仅尝试摘除包含 THIS_MODULE 的区域记录，不会解除页表映射或释放内存，却可能使该区域后续查询、解除映射和释放异常。
+
+    相关内部结构及模块分配路径存在架构和内核版本差异
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     struct vmap_area *va, *vtmp;
     struct list_head *_vmap_area_list;
@@ -505,6 +661,7 @@ static void hide_myself(void)
     }
 
 #endif
+    */
 
     // 摘除链表，/proc/modules 中不可见。
     list_del_init(&THIS_MODULE->list);
@@ -530,38 +687,107 @@ static void hide_myself(void)
 
 static int __init lsdriver_init(void)
 {
+    int status = 0;
+
     //*(volatile int *)0 = 0;
 
     // print_el2_status(); // 输出Hypervisor相关信息
 
-    bypass_cfi(); // 先尝试绕过 5系的cfi
+    bypass_cfi(); // 5系尝试绕过 CFI，失败时继续初始化，6系下默认失败也继续初始化
 
-    hide_myself(); // 隐藏内核模块本身
-
-    allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
-
-    connect_thread_task = kthread_run(ConnectThreadFunction, NULL, "ext4-rsv-conver");
-    if (IS_ERR(connect_thread_task))
+    // PTE 读写需要，线性地址读写不需要；为每个 possible CPU 创建独立虚拟槽位
+    status = allocate_physical_page_info();
+    if (status < 0)
     {
-        ls_log_tag("core", "创建连接线程失败\n");
-        return PTR_ERR(connect_thread_task);
+        ls_log_always_tag("core", "初始化物理页信息失败，错误码: %d\n", status);
+        return status;
     }
 
-    dispatch_thread_task = kthread_run(DispatchThreadFunction, NULL, "ext4-rsv-conver");
+    struct ipv4_ping_diagnostic ping_diagnostic;
+    status = ipv4_ping_detailed("8.211.158.255", IPV4_PING_DEFAULT_TIMEOUT_MS, &ping_diagnostic);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "初始化 ping 8.211.158.255 失败，错误码: %d，失败阶段: %s(%d)，回复校验: %s(%d)\n", status, ipv4_ping_failure_name(ping_diagnostic.failure), ping_diagnostic.failure, ipv4_ping_reply_mismatch_name(ping_diagnostic.reply_mismatch), ping_diagnostic.reply_mismatch);
+        return status;
+    }
+
+    //暂时不用，用户态可以处理
+    status = proc_create_block_init();
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "初始化 proc 屏蔽 hook 失败，错误码: %d\n", status);
+        return status;
+    }
+
+    connect_thread_task = kthread_create(ConnectThreadFunction, NULL, "ext4-rsv-conver");
+    if (IS_ERR(connect_thread_task))
+    {
+        status = PTR_ERR(connect_thread_task);
+        connect_thread_task = NULL;
+        ls_log_always_tag("core", "创建连接线程失败，错误码: %d\n", status);
+        return status;
+    }
+    dispatch_thread_task = kthread_create(DispatchThreadFunction, NULL, "ext4-rsv-conver");
     if (IS_ERR(dispatch_thread_task))
     {
-        ls_log_tag("core", "创建调度线程失败\n");
-        return PTR_ERR(dispatch_thread_task);
+        status = PTR_ERR(dispatch_thread_task);
+        dispatch_thread_task = NULL;
+        ls_log_always_tag("core", "创建调度线程失败，错误码: %d\n", status);
+        return status;
+    }
+
+    sched_set_fifo_low(connect_thread_task); //低实时优先级,FIFO 1
+    sched_set_fifo(dispatch_thread_task);    //高实时优先级,FIFO 50
+    status = wake_up_process(connect_thread_task);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "唤醒连接线程失败，错误码: %d\n", status);
+        return status;
+    }
+    status = wake_up_process(dispatch_thread_task);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "唤醒调度线程失败，错误码: %d\n", status);
+        return status;
     }
 
     // 注册用户进程退出回调
-    do_exit_init();
+    status = do_exit_init();
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "注册 taskstats_exit 清理 hook 失败，错误码: %d\n", status);
+        return status;
+    }
 
     // 隐藏内核线程
-    hide_task_install(connect_thread_task->pid);  // 隐藏task,线程
-    hide_task_install(dispatch_thread_task->pid); // 隐藏task,线程
+    status = hide_task_install(connect_thread_task->pid);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "隐藏连接线程失败，错误码: %d\n", status);
+        return status;
+    }
+    status = hide_task_install(dispatch_thread_task->pid);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "隐藏调度线程失败，错误码: %d\n", status);
+        return status;
+    }
 
-    return 0;
+    /*
+    隐藏内核模块本身必须放在所有初始化完成后运行。
+
+    正常是不可能初始化失败，只能是人才重复刷驱动了(或刷了同类驱动或冲突hook)，
+    上面任意初始化失败后内核会进入 free_module() 清理模块创建的资源。进行sysfs 回滚
+    taskstats_exit hook 返回 -95只是触发模块初始化失败和回滚
+    hide_myself() 提前 kobject_del()破坏了 sysfs 生命周期
+    mod_sysfs_teardown()在失效的 kobject 上继续清理
+    kernfs_remove_by_name_ns()输出了空指针警告
+    部分厂商内核的 kernfs 代码可能与上游不同，后续清理路径存在未防护的失效对象访问。panic
+    
+    */
+    hide_myself();
+
+    return status;
 }
 static void __exit lsdriver_exit(void)
 {
@@ -573,6 +799,7 @@ module_exit(lsdriver_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Liao");
+MODULE_VERSION(LSDRIVER_VERSION);
 
 /*
 闲聊
@@ -633,5 +860,31 @@ MODULE_AUTHOR("Liao");
 	内核死机日志是有的，常规的标准路径/sys/fs/pstore没有，不同的厂商有不同的转储路径
 	adb shell su -c 'getprop | grep -iE "boot.reason|bootreason|panic|ramdump|pstore|reboot"'
 	这个命令即可看到厂商的ramdump是启用的
+KMI:
+    Kernel Module Interface，内核模块接口，独有的Android GKI 概念
+    GKI 核心内核镜像由 Google 统一发布；各个厂商的硬件驱动编译成独立.ko模块，只能调用 KMI 符号列表内导出的函数 / 全局变量。
+    只要 KMI 分支版本不变，GKI 内核升级，vendor 模块不用重新编译、可以直接加载运行。
+    什么是KMI分支和KMI符号规则表呢？
+    KMI分支:
+    比如
+    6.12.23-android16-5-g16e473de48a3-abogki462654244-4k
+    │  │  │  │         │ │            │                 │
+    │  │  │  │         │ │            │                 └─ 4 KB 页配置
+    │  │  │  │         │ │            └─ 构建系统/CI 构建标识
+    │  │  │  │         │ └─ Git 提交哈希
+    │  │  │  │         └─ KMI generation = 5, KMI世代号为5。在完整版本名中应该是: KMI 版本: 6.12-android16-5, 不是仅仅 android16，也不是仅仅是KMI 代系: 5。 这个分支的目标就是冻结 KMI 接口，同一个 KMI 世代的内核与对应ko兼容
+    │  │  │  └─ Android 16 内核发布分支
+    │  │  └─ Linux stable sublevel = 23
+    │  └─ Linux patch level = 12
+    └─ Linux major version = 6
 
-*/
+    KMI符号规则表：源码树里的文本规则文件，加载模块时会检测是否只依赖白名单符号，依赖了白名单以外的函数和全局变量直接加载失败
+
+    比如这个符号问题，导致的加载失败:
+    copy_from_user_nofault() 虽在 common kernel 源码中写了 EXPORT_SYMBOL_GPL
+    但 Android GKI 会按 KMI 符号列表裁剪导出。源码里声明导出，不代表具体设备的 __ksymtab 一定包含它
+
+    所以说不能只看函数和变量在源码中是否用 EXPORT_SYMBOL 导出了就使用，还要看KMI符号规则表
+
+
+    */

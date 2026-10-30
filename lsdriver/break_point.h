@@ -2,22 +2,11 @@
 #define BREAK_POINT_H
 
 #include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/hw_breakpoint.h>
-#include <linux/perf_event.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
-#include <linux/slab.h>
-#include <linux/spinlock.h>
-#include <linux/uaccess.h>
 #include <asm/ptrace.h>
 
-#include <linux/kallsyms.h>
-#include <linux/perf_event.h>
-#include <linux/hw_breakpoint.h>
-#include <linux/slab.h>
-
-#include "io_struct.h"
+#include "io_version/io_struct.h"
 
 // 校验断点配置存在，并且目标线程组 ID 有效。
 static inline bool bp_info_is_valid(const struct break_point *info)
@@ -103,7 +92,7 @@ static inline struct bp_point *bp_info_find_active_point(struct break_point *inf
     return NULL;
 }
 
-// 查找下一个指定类型的已配置断点；next_slot 非空时由函数自动推进迭代位置。
+// 查找指定类型的已配置断点；next_slot 为空时返回首个匹配项，非空时由调用方持有并自动推进迭代位置。
 static inline struct bp_point *bp_info_find_configured_type(struct break_point *info, enum bp_type type, size_t *next_slot)
 {
     if (!bp_info_is_valid(info)) return NULL;
@@ -148,20 +137,17 @@ static inline struct bp_point *bp_info_find_type_for_task(struct break_point *in
     return NULL;
 }
 
-// 按规范化 PC 查找执行断点配置。
-static inline struct bp_point *bp_info_find_point_by_pc(struct break_point *info, uint64_t raw_pc)
+// 按 PC 查找执行断点配置。
+static inline struct bp_point *bp_info_find_point_by_pc(struct break_point *info, uint64_t pc)
 {
-    uint64_t pc;
-
     if (!bp_info_is_valid(info)) return NULL;
-    pc = untagged_addr(raw_pc) & ~0x3ULL;
 
     for (size_t slot = 0; slot < BP_CONFIG_MAX; slot++)
     {
         struct bp_point *point = &info->points[slot];
 
         if (!bp_point_is_configured_type(point, BP_BREAKPOINT_X)) continue;
-        if ((untagged_addr(READ_ONCE(point->hit_addr)) & ~0x3ULL) != pc) continue;
+        if (READ_ONCE(point->hit_addr) != pc) continue;
         return point;
     }
 
@@ -613,12 +599,12 @@ static inline void sample_hbp_handler(struct pt_regs *regs, struct fp_regs *fp_r
     }
 }
 
-static inline void sample_hbp_handler_entry(void *regs, void *fp_regs, void *hit_point)
+static void sample_hbp_handler_entry(void *regs, void *fp_regs, void *hit_point)
 {
     sample_hbp_handler((struct pt_regs *)regs, (struct fp_regs *)fp_regs, (struct bp_point *)hit_point);
 }
 
-static inline void prepare_break_point_handlers(struct break_point *info)
+static void prepare_break_point_handlers(struct break_point *info)
 {
     size_t point_slot = 0;
     struct bp_point *point;
@@ -630,7 +616,7 @@ static inline void prepare_break_point_handlers(struct break_point *info)
 }
 
 #include "arm64_hwdbg.h"
-static inline int set_process_hwbp(struct break_point *info)
+static int set_process_hwbp(struct break_point *info)
 {
     if (!info) return -EINVAL;
 
@@ -642,7 +628,7 @@ static inline int set_process_hwbp(struct break_point *info)
     return 0;
 }
 
-static inline void remove_process_hwbp(void)
+static void remove_process_hwbp(void)
 {
     struct break_point *info = READ_ONCE(g_bp_info);
 
@@ -651,8 +637,8 @@ static inline void remove_process_hwbp(void)
 }
 
 //#include "arm64_ptedbg.h"
-#include "arm64_ptedbg-20260709-000359.h"
-static inline int set_process_ptebp(struct break_point *info)
+#include "arm64_ptedbg-20260822-000439.h"
+static int set_process_ptebp(struct break_point *info)
 {
     if (!info) return -EINVAL;
 
@@ -661,7 +647,7 @@ static inline int set_process_ptebp(struct break_point *info)
     return start_ptebp_monitor(info);
 }
 
-static inline void remove_process_ptebp(void)
+static void remove_process_ptebp(void)
 {
     struct break_point *info = g_ptebp_info;
 
@@ -669,8 +655,26 @@ static inline void remove_process_ptebp(void)
     if (info) __builtin_memset(info, 0, sizeof(*info));
 }
 
+#include "arm64_dptdbg.h"
+static int set_process_dptdbg(struct break_point *info)
+{
+    if (!info) return -EINVAL;
+
+    prepare_break_point_handlers(info);
+
+    return dptdbg_start_monitor(info);
+}
+
+static void remove_process_dptdbg(void)
+{
+    struct break_point *info = READ_ONCE(g_dptdbg.info);
+
+    dptdbg_stop_monitor();
+    if (info) __builtin_memset(info, 0, sizeof(*info));
+}
+
 #include "arm64_stepdbg.h"
-static inline int set_process_stepbp(struct break_point *info)
+static int set_process_stepbp(struct break_point *info)
 {
     if (!info) return -EINVAL;
 
@@ -679,7 +683,7 @@ static inline int set_process_stepbp(struct break_point *info)
     return start_stepbp_monitor(info);
 }
 
-static inline void remove_process_stepbp(void)
+static void remove_process_stepbp(void)
 {
     struct break_point *info = g_stepbp_info;
 

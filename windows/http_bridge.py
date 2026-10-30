@@ -19,6 +19,7 @@ from typing import Any
 DEFAULT_ANDROID_HOST = os.getenv("ANDROID_HTTP_HOST", "auto").strip() or "auto"
 DEFAULT_ANDROID_PORT = int(os.getenv("ANDROID_HTTP_PORT", "9494"))
 DEFAULT_ANDROID_TIMEOUT_SECONDS = float(os.getenv("ANDROID_HTTP_TIMEOUT", "4"))
+SIGNATURE_TIMEOUT_SECONDS = 20.0
 MIN_HTTPS_TIMEOUT_SECONDS = 15.0
 LAN_DISCOVERY_MAX_WORKERS = 24
 LAN_DISCOVERY_PING_TIMEOUT_MS = 150
@@ -251,7 +252,7 @@ def normalize_breakpoint_points(points: list[dict[str, Any]]) -> list[dict[str, 
 @dataclass(frozen=True)
 class SavedAddressState:
     address: int
-    address_hex: str
+    address_text: str
     value_type: str
     value_type_label: str
     value_kind: str
@@ -265,11 +266,10 @@ class SavedAddressState:
     def from_dict(cls, payload: dict[str, Any]) -> "SavedAddressState":
         value_type = normalize_value_type(str(payload.get("value_type", "")))
         value_kind = normalize_saved_kind(str(payload.get("value_kind", "numeric")))
-        address = int(payload.get("address", 0))
-        address_hex = str(payload.get("address_hex") or format_address(address))
+        address = int(str(payload.get("address", "0x0")), 0)
         return cls(
             address=address,
-            address_hex=address_hex,
+            address_text=format_address(address),
             value_type=value_type,
             value_type_label=str(payload.get("value_type_label") or VALUE_TYPE_LABELS[value_type]),
             value_kind=value_kind,
@@ -580,7 +580,8 @@ class AndroidHttpBridge(AndroidProtocolMixin):
 
             request_body = json.dumps(request_obj, ensure_ascii=False).encode("utf-8")
             operation = str(request_obj.get("operation") or "")
-            timeout_seconds = max(self.timeout_seconds, MIN_HTTPS_TIMEOUT_SECONDS) if endpoint.scheme == "https" else self.timeout_seconds
+            timeout_seconds = SIGNATURE_TIMEOUT_SECONDS if operation.startswith("signature.") else self.timeout_seconds
+            timeout_seconds = max(timeout_seconds, MIN_HTTPS_TIMEOUT_SECONDS) if endpoint.scheme == "https" else timeout_seconds
             connection_class = http.client.HTTPSConnection if endpoint.scheme == "https" else http.client.HTTPConnection
             connection = connection_class(endpoint.host, endpoint.port, timeout=timeout_seconds)
             try:

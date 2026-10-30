@@ -1,3 +1,7 @@
+/*
+ARM64 指令解码器：SME 编码空间占位。
+
+*/
 #include "arm64_decode.h"
 
 /* 当前只识别 SME encoding space，完整的 SME 操作数语义尚未实现。 */
@@ -5,8 +9,7 @@ enum arm64_decode_status arm64_decode_sme(uint32_t raw, struct arm64_decoded_ins
 {
     /* 经典 SME 主编码空间要求 bit[31] == 1；bit[31] == 0 的 op0=0000
     组合在 A64 顶层表中仍是未分配空间，不能仅凭 op0 将其认领为 SME。 */
-    if (!(raw & 0x80000000U)) return ARM64_DECODE_UNALLOCATED;
+    if (!ARM64_DECODE_BIT(raw, 31)) return ARM64_DECODE_UNALLOCATED;
 
-    decoded->instruction_class = ARM64_INSTRUCTION_CLASS_SME;
     return ARM64_DECODE_UNSUPPORTED;
 }

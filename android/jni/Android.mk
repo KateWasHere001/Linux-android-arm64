@@ -70,7 +70,7 @@ LOCAL_CPPFLAGS += -O3                                # [优化] 保持O3，避�
 # 可执行 `ndk-build LS_DEBUG_LOG=1`，或将下一行改为 `LS_DEBUG_LOG := 1`。
 LS_DEBUG_LOG ?= 1
 LOCAL_CFLAGS += -DLS_DEBUG_LOG=$(LS_DEBUG_LOG)
-LOCAL_CPPFLAGS += -DLS_DEBUG_LOG=$(LS_DEBUG_LOG) -include $(SHARED_JNI_ROOT)/include/logger.h
+LOCAL_CPPFLAGS += -DLS_DEBUG_LOG=$(LS_DEBUG_LOG) -include $(LOCAL_PATH)/logger/logger.h
 
 
 
@@ -107,7 +107,6 @@ LOCAL_LDLIBS := -lvulkan -landroid -llog -lEGL -lGLESv3
 
 include $(BUILD_EXECUTABLE)
 
-
 # ------------------------------------------------------------------
 # Build finished, push the generated binary to the connected device.
 # The default ndk-build target is `all`, so we extend it here instead
@@ -117,8 +116,9 @@ AKERNEL_TEMP_FILE := /data/local/tmp/$(LOCAL_MODULE_FILENAME)
 AKERNEL_BINARY := $(NDK_APP_LIBS_OUT)/$(TARGET_ARCH_ABI)/$(LOCAL_MODULE_FILENAME)
 AKERNEL_REMOTE_FILE := $(AKERNEL_PUSH_DIR)/$(LOCAL_MODULE_FILENAME)
 AKERNEL_REMOTE_NEW_FILE := $(AKERNEL_REMOTE_FILE).new
-
 .PHONY: push-akernel
-push-akernel: $(AKERNEL_BINARY) ; @adb push "$(call host-path,$(AKERNEL_BINARY))" "$(AKERNEL_TEMP_FILE)" && adb shell "su -c 'mkdir -p $(AKERNEL_PUSH_DIR) && cp $(AKERNEL_TEMP_FILE) $(AKERNEL_REMOTE_NEW_FILE) && chmod 755 $(AKERNEL_REMOTE_NEW_FILE) && mv -f $(AKERNEL_REMOTE_NEW_FILE) $(AKERNEL_REMOTE_FILE)'"
+push-akernel: $(AKERNEL_BINARY)
+	@adb push "$(call host-path,$(AKERNEL_BINARY))" "$(AKERNEL_TEMP_FILE)"
+	@adb shell "echo 'mkdir -p $(AKERNEL_PUSH_DIR) && cp $(AKERNEL_TEMP_FILE) $(AKERNEL_REMOTE_NEW_FILE) && chmod 755 $(AKERNEL_REMOTE_NEW_FILE) && mv -f $(AKERNEL_REMOTE_NEW_FILE) $(AKERNEL_REMOTE_FILE)' | su"
 
 all: push-akernel
